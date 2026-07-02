@@ -2,7 +2,7 @@
 
 **A non-AI, deterministic cognitive engine that learns what it needs, when it needs it — running entirely on your phone.**
 
-No LLM. No tokens. No embeddings. No cloud. No training data. Just a baby brain that grows its own understanding by exploring the world through sensors and actions.
+No LLM. No subword tokens. No embeddings. No cloud. No training data. Just a baby brain that grows its own understanding by exploring the world through sensors and actions.
 
 ---
 
@@ -14,8 +14,8 @@ Grounded is the opposite:
 - **It knows nothing at birth.** A tiny seed of ~30 foundational concepts (matter, motion, energy, space, time) and the machinery to grow.
 - **It learns relationally.** Every concept is a node. Every connection is a typed edge (IsA, HasProperty, Requires, Activates, Inhibits). Meaning is the *pattern of relations* — not a vector of floating-point numbers.
 - **It's grounded.** Sensors (accelerometer, light, proximity) feed real values into the graph. Actions produce real Android intents. No symbol floats free.
-- **It's curious.** When it encounters something it doesn't understand (a token with no relational edges), it recursively resolves it against an offline knowledge base until every leaf is a fundamental physical primitive — or it hits depth 10 and shrugs.
-- **It's deterministic.** Same input, same output, forever. No randomness. No probability. No gradient descent. Just energy flowing along known paths.
+- **It's curious.** When it encounters something it doesn't understand (a word with no relational edges in the graph), it recursively resolves it against an offline knowledge base until every leaf is a fundamental physical primitive — or it hits depth 10 and shrugs.
+- **It's deterministic per tick, but evolves over time.** No randomness, no probability, no gradient descent — the engine itself has no dice. But the graph grows. A question today may get "I don't know." That same question a week later, after hundreds of curiosity cycles have added edges and resolved gaps, gets a real answer. Like a child: the machinery is fixed, but the structure it's built on expands.
 
 This is not machine learning. This is *structure building*.
 
@@ -38,7 +38,7 @@ No allocations in the hot path. Double-buffered activation arrays flipped atomic
 
 When you say "cat dressed as a pirate walking on two legs":
 
-1. **Tokenize** → [cat, dressed, as, a, pirate, walking, on, two, legs]
+1. **Split into words** → [cat, dressed, as, a, pirate, walking, on, two, legs]
 2. **Gap detect** → cat has edges (is an animal, has fur). pirate has no edges → **GAP**
 3. **Resolve** → Look up "pirate" in offline knowledge: "is a person. wears tricorn hat. carries cutlass. sails ships."
 4. **Parse** → Extract predicates: pirate IsA person, pirate HasProperty tricorn_hat...
@@ -135,14 +135,14 @@ The same compound prompt feeds into the asset ingestor:
 |---|---|---|
 | **Understanding** | Statistical token prediction | Relational graph traversal |
 | **Grounding** | None (floating symbols) | Every node traces to sensor or action |
-| **Determinism** | None (temperature sampling) | Same input → same output, always |
+| **Determinism** | None (temperature sampling) | Deterministic per tick; graph grows over time |
 | **Offline** | No (needs datacenter) | Yes (runs on a phone) |
 | **Power** | Watts × 1000 | Milliwatts |
 | **Learning** | Pre-trained on all of internet | Grows through interaction |
 | **Size** | GB–TB | KB–MB |
 | **Honesty** | Hallucinates constantly | Can only traverse what it knows |
 
-Grounded doesn't guess. It traverses. When it doesn't know something, it *knows* it doesn't know — that's a knowledge gap, and it resolves it.
+Grounded doesn't guess. It traverses what it knows. When it doesn't know something, it *knows* it doesn't know — that's a knowledge gap, and it resolves it. Ask it the same thing next week and it may have a better answer.
 
 ## Build
 
