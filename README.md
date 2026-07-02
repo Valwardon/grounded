@@ -34,6 +34,16 @@ For each node, every 16ms tick:
 
 No allocations in the hot path. Double-buffered activation arrays flipped atomically. Zero-lock reads.
 
+### The Self Node
+
+Node index 1 is always `SELF` — the engine's persistent "I". Pre-inserted with base activation 1.0 and decay 1.0, it never fades. Every experience attaches here:
+
+- Sensor reading → `SELF --GroundedIn--> instrument`
+- Intent received → `SELF --HasProperty--> object`
+- Action fired → `SELF --CausedBy--> action_node`
+
+`introspect()` returns the entire subgraph reachable from SELF. The engine can always answer "what do I know?" because every concept it's encountered has a relational path back to itself. SELF persists across restarts — serialized as node 1 in the bincode graph file.
+
 ### The Curiosity Loop
 
 When you say "cat dressed as a pirate walking on two legs":
@@ -120,13 +130,17 @@ The same compound prompt feeds into the asset ingestor:
 - [x] 4-phase spreading activation (decay/inject/spread/fire)
 - [x] 30+ verb→CD action mappings
 - [x] Lock-free SPSC event channel (128 slots)
+- [x] Self node: `NodeId::SELF` (index 1) pre-inserted in every graph with base activation 1.0, decay 1.0 (never decays)
+- [x] Self-linking: every sensor reading, intent, and fired action anchors to SELF via `link_to_self()` — SELF never dies
+- [x] `introspect()` — returns everything SELF is connected to. The engine answers "what do I know?" by traversing edges from itself
+- [x] Self persists across restarts (serialized as node index 1 in bincode)
 - [x] Recursive curiosity harvester (Tokio, Semaphore(4), depth 10)
 - [x] 6 grammar patterns for offline definition resolution
 - [x] Quadruped→biped geometric transform
 - [x] UniFFI bridge to Kotlin
 - [x] Android ForegroundService with wakelock + keepalive watchdog
 - [ ] `cargo test` pass (needs actual test environment)
-- [ ] Integration: persist graph → survive restart → resume curiosity
+- [ ] Integration: persist graph → survive restart → resume curiosity with self node intact
 - [ ] Integration: prompt → render ops → wgpu draws skeleton
 
 ## Why not just use an LLM?
