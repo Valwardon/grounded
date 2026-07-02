@@ -147,3 +147,40 @@ pub fn tick_count() -> u64 {
         .map(|lc| lc.tick_count())
         .unwrap_or(0)
 }
+
+/// Introspect — return everything the self node is connected to.
+/// Returns vec of (node_id, label, relation).
+pub fn introspect() -> Vec<(u64, String, String)> {
+    let guard = lifecycle().read();
+    guard
+        .as_ref()
+        .map(|lc| {
+            lc.introspect()
+                .into_iter()
+                .map(|(id, label, rel)| (id.0, label, format!("{:?}", rel)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Link a specific node to the self node for grounding.
+pub fn link_to_self(node_id: u64, relation: &str) -> bool {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        if let Some(ref ctx) = lc.ctx {
+            let rel = match relation {
+                "is_a" => Relation::IsA,
+                "has" => Relation::HasProperty,
+                "requires" => Relation::Requires,
+                "causes" => Relation::CausedBy,
+                "implies" => Relation::Implies,
+                "grounded_in" => Relation::GroundedIn,
+                "activates" => Relation::Activates,
+                "inhibits" => Relation::Inhibits,
+                _ => Relation::AssociatedWith,
+            };
+            return ctx.link_to_self(rel, NodeId::from_raw(node_id));
+        }
+    }
+    false
+}

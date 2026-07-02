@@ -22,6 +22,9 @@ impl NodeId {
     }
 
     pub const ZERO: Self = NodeId(0);
+    /// The persistent self node — every experience is anchored to it.
+    /// Inserted at index 1 in every GraphArena.
+    pub const SELF: Self = NodeId(1);
 }
 
 // ────────────────────────────────────────────────────────────
@@ -178,6 +181,7 @@ impl GraphArena {
             nodes: Vec::with_capacity(cap),
             label_index: Vec::with_capacity(cap),
         };
+        // Index 0: null sentinel
         arena.nodes.push(parking_lot::RwLock::new(GroundedNode {
             id: NodeId::ZERO,
             label: String::from("<null>"),
@@ -188,6 +192,18 @@ impl GraphArena {
             base_activation: 0.0,
             edges: Vec::new(),
         }));
+        // Index 1: the persistent self — every experience anchors here
+        arena.nodes.push(parking_lot::RwLock::new(GroundedNode {
+            id: NodeId::SELF,
+            label: String::from("self"),
+            node_type: NodeType::State,
+            grounding: Grounding::Abstract,
+            decay: 1.0,
+            threshold: f64::MAX,
+            base_activation: 1.0,
+            edges: Vec::new(),
+        }));
+        arena.label_index.push(("self".to_string(), NodeId::SELF));
         arena
     }
 
@@ -236,6 +252,45 @@ impl GraphArena {
 
     pub fn len(&self) -> usize {
         self.nodes.len()
+    }
+
+    /// Attach a relational edge from the self node to a target.
+    /// Returns true if the target existed.
+    pub fn link_to_self(&mut self, relation: Relation, target: NodeId) -> bool {
+        if target.0 as usize >= self.nodes.len() || target == NodeId::ZERO || target == NodeId::SELF {
+            return false;
+        }
+        let self_idx = NodeId::SELF.0 as usize;
+        if self_idx >= self.nodes.len() {
+            return false;
+        }
+        self.nodes[self_idx].write().edges.push(Edge {
+            relation,
+            target,
+            weight_override: None,
+        });
+        true
+    }
+
+    /// Return all nodes directly connected to the self node.
+    pub fn introspect(&self) -> Vec<(NodeId, String, Relation)> {
+        let self_idx = NodeId::SELF.0 as usize;
+        if self_idx >= self.nodes.len() {
+            return Vec::new();
+        }
+        let self_node = self.nodes[self_idx].read();
+        self_node
+            .edges
+            .iter()
+            .filter_map(|edge| {
+                let idx = edge.target.0 as usize;
+                if idx >= self.nodes.len() {
+                    return None;
+                }
+                let node = self.nodes[idx].read();
+                Some((edge.target, node.label.clone(), edge.relation))
+            })
+            .collect()
     }
 }
 
@@ -305,6 +360,16 @@ impl SemanticContext {
             activation: RwLock::new(ActivationBuffer::new(len)),
             tick: AtomicU64::new(0),
         })
+    }
+
+    /// Return everything the self node is connected to.
+    pub fn introspect(&self) -> Vec<(NodeId, String, Relation)> {
+        self.graph.read().introspect()
+    }
+
+    /// Link a node to self with a given relation.
+    pub fn link_to_self(&self, relation: Relation, target: NodeId) -> bool {
+        self.graph.write().link_to_self(relation, target)
     }
 }
 

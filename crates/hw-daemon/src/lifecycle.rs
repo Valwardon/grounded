@@ -125,6 +125,14 @@ impl CognitiveLifecycle {
         self.missed_heartbeats.load(Ordering::Relaxed)
     }
 
+    /// Introspect — return everything the self node is connected to.
+    pub fn introspect(&self) -> Vec<(NodeId, String, Relation)> {
+        self.ctx
+            .as_ref()
+            .map(|ctx| ctx.introspect())
+            .unwrap_or_default()
+    }
+
     /// Get the current tick counter from the semantic context.
     pub fn tick_count(&self) -> u64 {
         self.ctx

@@ -176,12 +176,20 @@ impl CognitiveDaemon {
                         for frame in &parsed.frames {
                             engine.inject_frame(frame, BASE_INJECT * parsed.confidence);
                         }
+                        // Anchor the intent to self
+                        if let Some(obj) = parsed.frames.first().and_then(|f| f.object) {
+                            self.ctx.link_to_self(Relation::HasProperty, obj);
+                        }
                     }
                     CognitiveEvent::SensorReading { sensor, channel, value, .. } => {
                         let parsed = parse_sensor_event(&sensor, channel, value);
                         let mut engine = self.engine.lock();
                         for frame in &parsed.frames {
                             engine.inject_frame(frame, BASE_INJECT);
+                        }
+                        // Anchor the sensor to self
+                        if let Some(inst) = parsed.frames.first().and_then(|f| f.instrument) {
+                            self.ctx.link_to_self(Relation::GroundedIn, inst);
                         }
                     }
                     CognitiveEvent::TimerElapsed { timer_id } => {
@@ -203,7 +211,12 @@ impl CognitiveDaemon {
                     engine.tick().to_vec()
                 };
 
-                // ── 3. Dispatch fired actions ──
+                // ── 3. Anchor fired actions to self ──
+                for action in &fired {
+                    self.ctx.link_to_self(Relation::CausedBy, action.node_id);
+                }
+
+                // ── 4. Dispatch fired actions ──
                 let mut outputs = self.output_channel.write();
                 for action in &fired {
                     match &action.grounding {
