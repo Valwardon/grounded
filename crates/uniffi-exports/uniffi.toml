@@ -1,0 +1,9 @@
+[bindings]
+kotlin = true
+swift = false
+python = false
+ruby = false
+
+[bindings.kotlin]
+package_name = "com.grounded.engine"
+cdylib_name = "semantic_engine"

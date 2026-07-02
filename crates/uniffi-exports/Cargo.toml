@@ -1,0 +1,17 @@
+[package]
+name = "uniffi-exports"
+version = "0.1.0"
+edition = "2024"
+description = "UniFFI export surface for the Grounded Semantic Engine"
+
+[lib]
+crate-type = ["cdylib", "staticlib"]
+name = "semantic_engine"
+
+[dependencies]
+uniffi = { version = "0.28", features = ["cli"] }
+hw-daemon = { path = "../hw-daemon" }
+serde_json = { workspace = true }
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }

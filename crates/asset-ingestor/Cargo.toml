@@ -1,0 +1,11 @@
+[package]
+name = "asset-ingestor"
+version = "0.1.0"
+edition = "2024"
+description = "Multi-modal asset deconstruction — compound prompts → operational trees → procedural rendering dispatch"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+semantic-graph = { path = "../semantic-graph" }
+curiosity-core = { path = "../curiosity-core" }

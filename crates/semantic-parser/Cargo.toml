@@ -1,0 +1,10 @@
+[package]
+name = "semantic-parser"
+version = "0.1.0"
+edition = "2024"
+description = "Conceptual Dependency parser and realizer — maps structured input to CD frames"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+semantic-graph = { path = "../semantic-graph" }

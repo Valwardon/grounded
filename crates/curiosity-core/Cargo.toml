@@ -1,0 +1,11 @@
+[package]
+name = "curiosity-core"
+version = "0.1.0"
+edition = "2024"
+description = "Recursive semantic dependency resolver — autonomous knowledge gap detection and resolution"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+semantic-graph = { path = "../semantic-graph" }

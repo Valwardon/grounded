@@ -1,0 +1,10 @@
+[package]
+name = "semantic-graph"
+version = "0.1.0"
+edition = "2024"
+description = "Grounded semantic graph with arena allocation and lock-free activation propagation"
+
+[dependencies]
+serde = { workspace = true, features = ["derive"] }
+bincode = { workspace = true }
+parking_lot = { workspace = true }
