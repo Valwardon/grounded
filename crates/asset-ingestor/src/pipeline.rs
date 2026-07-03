@@ -59,52 +59,33 @@ impl AssetPipeline {
 
 /// Realize a decomposed prompt into a JSON structure that
 /// the wgpu procedural renderer can consume directly.
+///
+/// All render ops pass through compile_to_ast() + validate_ast()
+/// before serialization. This ensures structural integrity of
+/// the render output.
 pub fn realize_to_render_json(prompt: &DecomposedPrompt) -> String {
-    let ops: Vec<serde_json::Value> = prompt
-        .render_ops
-        .iter()
-        .map(|op| {
-            serde_json::json!({
-                "op": match op.op_type {
-                    RenderOpType::DrawSkeleton => "draw_skeleton",
-                    RenderOpType::ApplyMesh => "apply_mesh",
-                    RenderOpType::OverlayTexture => "overlay_texture",
-                    RenderOpType::CompositeLayer => "composite",
-                    RenderOpType::Transform => "transform",
-                },
-                "label": op.component.label,
-                "attachment": {
-                    "parentSlot": op.component.attachment.parent_slot,
-                    "offset": op.component.attachment.offset,
-                    "rotation": op.component.attachment.rotation,
-                },
-                "transform": {
-                    "translate": op.component.transform.translate,
-                    "rotate": op.component.transform.rotate,
-                    "scale": op.component.transform.scale,
-                },
-                "shader": {
-                    "opacity": op.shader_params.opacity,
-                    "wireframe": op.shader_params.wireframe,
-                },
-                "children": op.component.children.iter().map(|c| {
-                    serde_json::json!({
-                        "label": c.label,
-                        "parentSlot": c.attachment.parent_slot,
-                    })
-                }).collect::<Vec<_>>(),
-            })
-        })
-        .collect();
+    let ast = compile_to_ast(prompt);
 
-    serde_json::to_string_pretty(&serde_json::json!({
-        "prompt": prompt.raw,
-        "subjects": prompt.subjects,
-        "predicates": prompt.predicates,
-        "modifiers": prompt.modifiers,
-        "render_ops": ops,
-    }))
-    .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into())
+    // Validate the AST — structural errors are reported
+    // but we still serialize (the renderer may still attempt
+    // best-effort rendering).
+    if let Err(e) = validate_ast(&ast) {
+        // Return a JSON structure that includes the error so the
+        // renderer can decide how to handle it.
+        let valid_json = render_ast_to_json(&ast);
+        let mut value: serde_json::Value =
+            serde_json::from_str(&valid_json).unwrap_or(serde_json::Value::Null);
+        if let serde_json::Value::Object(ref mut map) = value {
+            map.insert(
+                "validation_error".into(),
+                serde_json::json!(e.to_string()),
+            );
+        }
+        return serde_json::to_string_pretty(&value)
+            .unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into());
+    }
+
+    render_ast_to_json(&ast)
 }
 
 #[cfg(test)]
@@ -145,7 +126,29 @@ mod tests {
         let result = pipeline.process_prompt("pirate cat");
         let json = realize_to_render_json(&result);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(parsed.get("render_ops").is_some());
-        assert_eq!(parsed["subjects"][0], "pirate");
+        assert_eq!(parsed["type"], "scene", "AST root should be a scene");
+        assert!(parsed.get("validation_error").is_none(), "No validation errors expected");
+        assert!(parsed["children"].as_array().map(|a| !a.is_empty()).unwrap_or(false));
+    }
+
+    #[test]
+    fn render_json_validation_error_included() {
+        let g = GraphArena::with_capacity(8);
+        let ctx = std::sync::Arc::new(semantic_graph::SemanticContext::new(g));
+        let pipeline = AssetPipeline::new(ctx);
+
+        // Create an empty prompt that will produce an invalid AST
+        let empty_prompt = DecomposedPrompt {
+            raw: "".into(),
+            tokens: vec![],
+            subjects: vec![],
+            predicates: vec![],
+            modifiers: vec![],
+            components: vec![],
+            render_ops: vec![],
+        };
+        let json = realize_to_render_json(&empty_prompt);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(parsed.get("validation_error").is_some(), "Empty prompt should produce a validation error");
     }
 }

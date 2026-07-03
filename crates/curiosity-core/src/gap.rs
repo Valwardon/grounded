@@ -158,16 +158,8 @@ mod tests {
             threshold: 10.0,
             base_activation: 0.0,
             edges: vec![
-                Edge {
-                    relation: Relation::IsA,
-                    target: NodeId::from_raw(2), // "animal"
-                    weight_override: None,
-                },
-                Edge {
-                    relation: Relation::HasProperty,
-                    target: NodeId::from_raw(3), // "quadruped"
-                    weight_override: None,
-                },
+                Edge::new(Relation::IsA, NodeId::from_raw(2)), // "animal"
+                Edge::new(Relation::HasProperty, NodeId::from_raw(3)), // "quadruped"
             ],
             valence: 0.0,
         });
@@ -181,11 +173,7 @@ mod tests {
             decay: 0.9,
             threshold: 10.0,
             base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::HasProperty,
-                target: NodeId::from_raw(3),
-                weight_override: None,
-            }],
+            edges: vec![Edge::new(Relation::HasProperty, NodeId::from_raw(3))],
             valence: 0.0,
         });
 
@@ -198,11 +186,7 @@ mod tests {
             decay: 0.9,
             threshold: 10.0,
             base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::HasProperty,
-                target: cat_id,
-                weight_override: None,
-            }],
+            edges: vec![Edge::new(Relation::HasProperty, cat_id)],
             valence: 0.0,
         });
 

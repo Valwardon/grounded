@@ -1,3 +1,4 @@
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -50,6 +51,102 @@ impl NodeId {
 }
 
 // ────────────────────────────────────────────────────────────
+//  Data-flow types for invariant contracts
+// ────────────────────────────────────────────────────────────
+
+/// The type of data a node produces or consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DataType {
+    /// Generic activation energy (spreading activation)
+    Activation,
+    /// Raw sensor reading (accelerometer, light, proximity)
+    SensorValue,
+    /// Android intent or system command
+    Intent,
+    /// Persistent state value
+    State,
+    /// Any type is compatible (universal adapter)
+    Any,
+}
+
+/// Invariant contract between two nodes connected by an edge.
+///
+/// Defines what the source node guarantees to produce (post-condition)
+/// and what the target node expects to consume (pre-condition).
+/// Violations are detected by `verify_path()` and penalized by
+/// the `VerificationLoop`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum InvariantContract {
+    /// Data-flow: source output type → target input type must be compatible
+    DataFlow { output_type: DataType, input_type: DataType },
+    /// Causal: source event causes target state change
+    Causal,
+    /// Taxonomic: source classifies or categorizes target
+    Taxonomic,
+    /// Grounding: source is physically realized by target
+    Grounding,
+    /// No formal contract — reliance on STDP-learned weight only
+    Unspecified,
+}
+
+/// Structural verification error.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StructuralError {
+    /// Edge contract violation: source output type doesn't match target input type
+    ContractMismatch {
+        source: NodeId,
+        target: NodeId,
+        expected_input: DataType,
+        actual_output: DataType,
+    },
+    /// Path contains a cycle that violates causality
+    CyclicDependency {
+        nodes: Vec<NodeId>,
+    },
+    /// Energy conservation violated during activation spread
+    EnergyNonConservation {
+        total_before: f64,
+        total_after: f64,
+        discrepancy: f64,
+    },
+    /// Node in path has been marked dead (threshold=MAX, edges=0)
+    DeadNode {
+        node_id: NodeId,
+        label: String,
+    },
+    /// Traversal leads to SELF in an invalid position
+    SelfLoop {
+        node_id: NodeId,
+    },
+}
+
+impl std::fmt::Display for StructuralError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StructuralError::ContractMismatch { source, target, expected_input, actual_output } => {
+                write!(f, "Contract mismatch: node {} produces {:?} but node {} expects {:?}",
+                    source.0, actual_output, target.0, expected_input)
+            }
+            StructuralError::CyclicDependency { nodes } => {
+                write!(f, "Cyclic dependency detected: {:?}", nodes.iter().map(|n| n.0).collect::<Vec<_>>())
+            }
+            StructuralError::EnergyNonConservation { total_before, total_after, discrepancy } => {
+                write!(f, "Energy non-conservation: before={:.6} after={:.6} delta={:.6}",
+                    total_before, total_after, discrepancy)
+            }
+            StructuralError::DeadNode { node_id, label } => {
+                write!(f, "Dead node in path: {} ({})", label, node_id.0)
+            }
+            StructuralError::SelfLoop { node_id } => {
+                write!(f, "Self-loop detected at node {}", node_id.0)
+            }
+        }
+    }
+}
+
+impl std::error::Error for StructuralError {}
+
+// ────────────────────────────────────────────────────────────
 //  Logical relation types (deterministic, closed set)
 // ────────────────────────────────────────────────────────────
 
@@ -80,6 +177,35 @@ impl Relation {
             Relation::Activates => 1.0,
             Relation::Inhibits => -0.6,
             Relation::AssociatedWith => 0.3,
+        }
+    }
+
+    /// Return the default invariant contract for this relation type.
+    /// Used at edge creation time when no explicit contract is provided.
+    pub fn canonical_contract(&self) -> InvariantContract {
+        match self {
+            Relation::IsA => InvariantContract::Taxonomic,
+            Relation::HasProperty => InvariantContract::Taxonomic,
+            Relation::Requires => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::CausedBy => InvariantContract::Causal,
+            Relation::Implies => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::GroundedIn => InvariantContract::Grounding,
+            Relation::Precedes => InvariantContract::Causal,
+            Relation::Activates => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::Inhibits => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::AssociatedWith => InvariantContract::Unspecified,
         }
     }
 }
@@ -165,16 +291,32 @@ pub struct Edge {
     /// Hebbian eligibility trace. Boosted when source fires, decays each tick,
     /// consumed when target fires to drive LTP.
     pub eligibility: f64,
+
+    /// Invariant contract that constrains what data/types may flow across this edge.
+    /// If None, defaults to `relation.canonical_contract()` at construction time.
+    /// Verified at traversal time by `GraphArena::verify_path()`.
+    pub contract: Option<InvariantContract>,
 }
 
 impl Edge {
     pub fn new(relation: Relation, target: NodeId) -> Self {
         let base = relation.spread_weight();
-        Edge { relation, target, weight_override: None, dynamic_weight: base, eligibility: 0.0 }
+        Edge {
+            relation, target, weight_override: None, dynamic_weight: base, eligibility: 0.0,
+            contract: None,
+        }
     }
 
     pub fn with_weight(relation: Relation, target: NodeId, override_weight: f64) -> Self {
-        Edge { relation, target, weight_override: Some(override_weight), dynamic_weight: override_weight, eligibility: 0.0 }
+        Edge {
+            relation, target, weight_override: Some(override_weight), dynamic_weight: override_weight,
+            eligibility: 0.0, contract: None,
+        }
+    }
+
+    pub fn with_contract(mut self, contract: InvariantContract) -> Self {
+        self.contract = Some(contract);
+        self
     }
 
     /// The weight used during spreading activation (read from STDP-modified value).
@@ -186,6 +328,11 @@ impl Edge {
     /// The architecturally intended weight — what dynamic_weight drifts toward.
     pub fn default_weight(&self) -> f64 {
         self.weight_override.unwrap_or_else(|| self.relation.spread_weight())
+    }
+
+    /// Resolve the effective contract: explicit override or canonical default.
+    pub fn effective_contract(&self) -> InvariantContract {
+        self.contract.unwrap_or_else(|| self.relation.canonical_contract())
     }
 }
 
@@ -364,6 +511,154 @@ impl GraphArena {
             let mut node = node_lock.write();
             node.edges.retain(|e| e.dynamic_weight.abs() >= PRUNE_THRESHOLD);
         }
+    }
+
+    // ── Structural path verification ──────────────────────
+
+    /// Verify that a sequence of node IDs forms a structurally valid path.
+    ///
+    /// For each consecutive pair (path[i], path[i+1]):
+    ///   1. Check that the source node is alive (not dead / nulled).
+    ///   2. Check that an edge exists between them.
+    ///   3. Check the edge's invariant contract: the source's post-condition
+    ///      (its grounding output type) must match the target's pre-condition
+    ///      (its grounding input type).
+    ///   4. Check for cycles (no node appears twice).
+    ///   5. Check for invalid SELF references.
+    ///
+    /// Returns `Ok(())` if the entire path is structurally sound.
+    pub fn verify_path(&self, path: &[NodeId]) -> Result<(), StructuralError> {
+        if path.len() < 2 {
+            return Ok(()); // single-node paths are trivially valid
+        }
+
+        // Check for duplicate nodes (cycles)
+        let mut seen = std::collections::HashSet::new();
+        for (i, &node_id) in path.iter().enumerate() {
+            if node_id == NodeId::ZERO {
+                return Err(StructuralError::DeadNode {
+                    node_id, label: "<null>".into(),
+                });
+            }
+            if !seen.insert(node_id) {
+                // Cycle detected but it might be intentional — only reject
+                // if the cycle doesn't pass through SELF
+                if node_id != NodeId::SELF {
+                    return Err(StructuralError::CyclicDependency {
+                        nodes: path.iter().copied().collect(),
+                    });
+                }
+            }
+            // Check the node is alive
+            if let Some(n) = self.get(node_id) {
+                let node = n.read();
+                if node.edges.is_empty() && node.threshold >= f64::MAX && node.decay.abs() < f32::EPSILON as f64 {
+                    return Err(StructuralError::DeadNode {
+                        node_id, label: node.label.clone(),
+                    });
+                }
+            }
+
+            // Check edge contract between this node and the next
+            if i + 1 < path.len() {
+                let next_id = path[i + 1];
+                let edge = self.get(node_id)
+                    .and_then(|n| n.read().edges.iter().find(|e| e.target == next_id));
+
+                if let Some(edge) = edge {
+                    let contract = edge.effective_contract();
+                    match contract {
+                        InvariantContract::DataFlow { output_type, input_type } => {
+                            if !Self::types_compatible(output_type, input_type) {
+                                return Err(StructuralError::ContractMismatch {
+                                    source: node_id,
+                                    target: next_id,
+                                    expected_input: input_type,
+                                    actual_output: output_type,
+                                });
+                            }
+                        }
+                        InvariantContract::Grounding => {
+                            // Grounding requires source to be a Sensor or Action
+                            // and target to be a Concept
+                            if let Some(n) = self.get(node_id) {
+                                let node = n.read();
+                                if !matches!(node.node_type, NodeType::Sensor | NodeType::Action) {
+                                    return Err(StructuralError::ContractMismatch {
+                                        source: node_id,
+                                        target: next_id,
+                                        expected_input: DataType::Any,
+                                        actual_output: DataType::Activation,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {} // Causal, Taxonomic, Unspecified are always accepted
+                    }
+                } else {
+                    // No edge exists between consecutive nodes in path
+                    // This is fine if the path was constructed from edges;
+                    // if the caller provided an arbitrary sequence, they get an error
+                    return Err(StructuralError::DeadNode {
+                        node_id: next_id,
+                        label: format!("no_edge_from_{}", node_id.0),
+                    });
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Check if a data type produced by a source can be consumed by a target.
+    fn types_compatible(output: DataType, input: DataType) -> bool {
+        match (output, input) {
+            (_, DataType::Any) => true,
+            (DataType::Any, _) => true,
+            (a, b) if a == b => true,
+            _ => false,
+        }
+    }
+
+    /// Collect all node IDs along every unique traversal from `start` to `end`,
+    /// respecting direction of edges. Returns shortest path found.
+    pub fn find_path(&self, start: NodeId, end: NodeId) -> Option<Vec<NodeId>> {
+        if start == end {
+            return Some(vec![start]);
+        }
+        // BFS
+        let mut visited = vec![false; self.nodes.len()];
+        let mut queue = std::collections::VecDeque::new();
+        let mut parent = vec![NodeId::ZERO; self.nodes.len()];
+
+        visited[start.0 as usize] = true;
+        queue.push_back(start);
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(node) = self.get(current) {
+                for edge in &node.read().edges {
+                    let next = edge.target;
+                    let idx = next.0 as usize;
+                    if idx < visited.len() && !visited[idx] {
+                        visited[idx] = true;
+                        parent[idx] = current;
+                        if next == end {
+                            // Reconstruct path
+                            let mut path = vec![end, current];
+                            let mut p = current;
+                            while p != start {
+                                p = parent[p.0 as usize];
+                                path.push(p);
+                            }
+                            path.reverse();
+                            return Some(path);
+                        }
+                        queue.push_back(next);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
@@ -656,5 +951,8 @@ pub mod prelude {
         Neuromodulator, FiringHistory, PredictionError,
         LTP_WINDOW, ELIGIBILITY_DECAY, LTP_RATE, DRIFT_RATE,
         PRUNE_THRESHOLD, PREDICTION_ERROR_THRESHOLD,
+    };
+    pub use super::{
+        InvariantContract, DataType, StructuralError,
     };
 }

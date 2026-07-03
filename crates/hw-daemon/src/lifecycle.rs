@@ -286,7 +286,7 @@ impl CognitiveLifecycle {
                 label: label.into(),
                 node_type: NodeType::Sensor,
                 grounding: Grounding::Sensor { sensor_type: sensor_type.into(), channel, norm },
-                decay, threshold, base_activation: 0.0, edges: vec![Edge { relation: Relation::Activates, target: NodeId::from_raw(target), weight_override: None }],
+                decay, threshold, base_activation: 0.0, edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(target))],
                 valence: 0.0,
             }
         }
@@ -324,19 +324,19 @@ impl CognitiveLifecycle {
         g.insert(sensor_node("sensor_light", "light", 0,
             SensorNorm::Linear { scale: 0.001, offset: 0.0 }, 0.95, 0.8, 5));
         g.insert(concept_node("concept_movement", 0.9, 1.2, vec![
-            Edge { relation: Relation::Implies, target: NodeId::from_raw(6), weight_override: None },
+            Edge::new(Relation::Implies, NodeId::from_raw(6)),
         ]));
         g.insert(concept_node("concept_proximity", 0.9, 1.5, vec![
-            Edge { relation: Relation::Implies, target: NodeId::from_raw(6), weight_override: Some(0.5) },
+            Edge::with_weight(Relation::Implies, NodeId::from_raw(6), 0.5),
         ]));
         g.insert(concept_node("concept_darkness", 0.92, 1.0, vec![
-            Edge { relation: Relation::Activates, target: NodeId::from_raw(7), weight_override: None },
-            Edge { relation: Relation::Activates, target: NodeId::from_raw(8), weight_override: None },
+            Edge::new(Relation::Activates, NodeId::from_raw(7)),
+            Edge::new(Relation::Activates, NodeId::from_raw(8)),
         ]));
         g.insert(action_node("lock_screen", r#"{"action":"lockScreen","params":{}}"#, 0.5, 1.0));
         g.insert(action_node("toggle_flashlight", r#"{"action":"toggleFlashlight","params":{"on":true}}"#, 0.3, 1.0));
         g.insert(state_node("state_night_mode", "system", "night_mode", 0.99, vec![
-            Edge { relation: Relation::Inhibits, target: NodeId::from_raw(8), weight_override: Some(-0.3) },
+            Edge::with_weight(Relation::Inhibits, NodeId::from_raw(8), -0.3),
         ]));
 
         g

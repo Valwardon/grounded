@@ -16,7 +16,8 @@ Grounded is the opposite:
 - **It learns relationally.** Every concept is a node. Every connection is a typed edge (IsA, HasProperty, Requires, Activates, Inhibits). Meaning is the *pattern of relations* — not a vector of floating-point numbers.
 - **It's grounded.** Sensors (accelerometer, light, proximity) feed real values into the graph. Actions produce real Android intents. No symbol floats free.
 - **It's curious.** When it encounters something it doesn't understand (a word with no relational edges in the graph), it recursively resolves it against an offline knowledge base until every leaf is a fundamental physical primitive — or it hits depth 10 and shrugs.
-- **It's deterministic per tick, but evolves over time.** No randomness, no probability, no gradient descent — the engine itself has no dice. But the graph grows. A question today may get "I don't know." That same question a week later, after hundreds of curiosity cycles have added edges and resolved gaps, gets a real answer. Like a child: the machinery is fixed, but the structure it's built on expands.
+- **It's honest.** When it doesn't know something, it *knows* it doesn't know — that's a structural error, and it hurts. The verification loop spikes deviation gain and drops valence on faulty edges. The system is penalized for being wrong, deterministically.
+- **It's self-correcting.** Three layered guardrails — edge invariants, AST validation, runtime verification — prevent structural corruption. Every cognitive tick ends with a verification phase that catches energy leaks, broken paths, and contract violations before they accumulate.
 
 This is not machine learning. This is *structure building*.
 
@@ -25,7 +26,7 @@ This is not machine learning. This is *structure building*.
 ### Spreading Activation
 
 ```
-For each node, every 16ms tick (4-phase):
+For each node, every 16ms tick (6-phase):
   Phase 1 — Neuromodulator decay:
     novelty/arousal/reward leak toward baseline.
     Compute global threshold_mod, plasticity_mod.
@@ -44,6 +45,16 @@ For each node, every 16ms tick (4-phase):
     for each edge: decay eligibility, boost if source fired,
     if target fired: LTP = eligibility * rate * plasticity_mod,
     drift toward default weight, prune if |weight| < 0.005
+
+  Phase 5 — Valence update (preference formation):
+    fire + prediction error → negative drift
+    fire + no prediction error  → positive drift
+    SELF → slow drift toward +0.5
+
+  Phase 6 — Structural verification:
+    energy conservation check (pre-spread vs post-spread)
+    fired-chain path integrity (verify_path on edge contracts)
+    penalties: novelty spike, valence drop, edge prune marking
 ```
 
 No allocations in the hot path. Double-buffered activation arrays flipped atomically. Zero-lock reads.
@@ -54,7 +65,7 @@ Three global channels modulate behavior like brain chemistry:
 
 | Channel | Spiked by | Effect |
 |---------|-----------|--------|
-| **Novelty** | Curiosity gaps, prediction errors | Lowers thresholds (easier to fire), accelerates STDP |
+| **Novelty** | Curiosity gaps, prediction errors, structural errors | Lowers thresholds (easier to fire), accelerates STDP |
 | **Arousal** | Rapid sensor deltas (>0.5g) | Lowers thresholds, clamps curiosity loops |
 | **Reward** | Stable predictions over time | Solidifies recent edge changes |
 
@@ -151,7 +162,90 @@ The same compound prompt feeds into the asset ingestor:
    - Front legs → arms (rotate 90° up)
    - Back legs → legs (stretch 1.2x)
    - Spine → vertical (rotate -90°)
-4. **Render ops** → ordered JSON pipeline for wgpu or any GPU renderer
+4. **Render AST compilation** → `compile_to_ast()` converts ops into validated `RenderAst`
+5. **AST validation** → `validate_ast()` checks scene structure, skeleton references, conflicting transforms, blend mode compatibility
+6. **Serialization** → `render_ast_to_json()` produces verified JSON for the GPU renderer
+
+All render ops pass through compile-to-AST → validate → serialize. Structural errors detected at the AST level are included in the JSON output so the renderer can handle them gracefully.
+
+---
+
+## Three Structural Guardrails
+
+The engine has three layered defenses against structural corruption, forming a single architectural upgrade:
+
+### 1. Edge Invariants (compile-time / pre-execution)
+
+Every `Edge` carries an optional `InvariantContract` that constrains what data types may flow across it. If not explicitly set, `effective_contract()` falls back to the `Relation::canonical_contract()`:
+
+| Relation | Canonical Contract |
+|----------|--------------------|
+| `IsA` | Taxonomic |
+| `HasProperty` | Taxonomic |
+| `Requires` | DataFlow(SensorValue → State) |
+| `CausedBy` | Causal |
+| `GroundedIn` | Grounding |
+| `Implies` | Causal |
+| `Precedes` | Causal |
+| `Activates` | DataFlow(Activation → Activation) |
+| `Inhibits` | DataFlow(Activation → Activation) |
+| `AssociatedWith` | Unspecified |
+
+**`DataType`** enum: `Activation`, `SensorValue`, `Intent`, `State`, `Any`.
+
+**`GraphArena::verify_path(path)`** validates a sequence of node IDs:
+1. Checks source node is alive (not nulled / dead)
+2. Checks edge exists between consecutive nodes
+3. Resolves effective contract — verifies source output type matches target input type
+4. Detects cycles (non-SELF duplicates)
+5. Detects self-loops and invalid SELF references
+
+Returns `Ok(())` or specific `StructuralError` variant.
+
+**`GraphArena::find_path(start, end)`** uses BFS to find the shortest valid traversal between two nodes, returning the path for verification.
+
+### 2. AST-Driven Integrity (asset pipeline)
+
+The asset pipeline no longer serializes `RenderOp` directly. All output passes through a validated intermediate representation:
+
+**`RenderAst`** enum:
+- `Scene { label, children }` — root node
+- `DrawSkeleton { label, bones, color_palette, wireframe, opacity, blend_mode }`
+- `ApplyTransform { target_label, translate, rotate, scale }`
+- `ApplyMesh { skeleton_label, mesh_label, color_palette, blend_mode }`
+- `Composite { label, sources, blend_mode, opacity }`
+
+**`compile_to_ast(prompt) -> RenderAst`** converts a `DecomposedPrompt` into a tree of `RenderAst` nodes.
+
+**`validate_ast(ast) -> Result<(), StructuralError>`** checks:
+- Scene must have at least one child
+- `ApplyTransform` must reference an existing skeleton label
+- `ApplyMesh` must reference an existing skeleton label
+- No conflicting transforms on the same target
+- `Composite` sources must reference labels defined earlier in the scene
+- All blend modes are valid
+
+**`render_ast_to_json(ast)`** serializes the validated AST into JSON for the wgpu renderer. If validation fails, the error is embedded in the JSON output so the renderer can decide how to handle it.
+
+### 3. Runtime Verification Loop (Phase 6)
+
+After every cognitive tick's valence update (Phase 5), a verification phase runs before the firing history advances:
+
+**`VerificationLoop::verify(ctx, modulators, energy_before, energy_after, fired_chain) -> Vec<VerificationEvent>`**:
+
+Checks performed:
+- **Energy conservation**: Sum absolute activation before Phase 3 vs after Phase 3. If discrepancy > 1%, a `StructuralError::EnergyNonConservation` is emitted.
+- **Path integrity**: The chain of nodes that fired this tick is passed through `GraphArena::verify_path()`. If it fails, a `StructuralError::ContractMismatch` (or other error) is emitted.
+
+On structural fault:
+- `modulators.spike_novelty(discrepancy * 0.5)` — novelty spikes proportional to the violation
+- Valence of every node in the faulty chain drops by -0.05 per 1% energy discrepancy
+- Faulty edges are marked for pruning (`dynamic_weight = 0.0`)
+- The `ActivationEngine.structural_faults` Vec accumulates all `VerificationEvent`s for the daemon to log
+
+The system hurts when it's wrong — deterministically. Structural errors are NOT silent failures. They propagate as novelty (making thresholds easier to fire), valence drops (making faulty concepts less liked), and edge pruning (removing corrupted connections).
+
+---
 
 ## Architecture
 
@@ -171,11 +265,11 @@ The same compound prompt feeds into the asset ingestor:
 │  │                                                    │ │
 │  │  ┌─────────────┐   ┌──────────────────────────┐  │ │
 │  │  │ EventChannel│──►│ CognitiveDaemon (16ms)   │  │ │
-│  │  │ (SPSC 128)  │   │ ├─ Decay/Inject/Spread  │  │ │
-│  │  │             │   │ ├─ Fire → OutputChannel  │  │ │
-│  │  │ Sensor data │   │ └─ Graph commands        │  │ │
-│  │  │ Intent JSON │   └──────────────────────────┘  │ │
-│  │  └─────────────┘                                 │ │
+│  │  │ (SPSC 128)  │   │ ├─ Phase 1-5 tick       │  │ │
+│  │  │             │   │ ├─ Phase 6: verify       │  │ │
+│  │  │ Sensor data │   │ ├─ Output channel        │  │ │
+│  │  │ Intent JSON │   │ └─ Graph commands        │  │ │
+│  │  └─────────────┘   └──────────────────────────┘  │ │
 │  │                                                    │ │
 │  │  ┌──────────────────────────────────────────┐  │ │
 │  │  │ Curiosity Harvester (Tokio async)        │  │ │
@@ -187,9 +281,17 @@ The same compound prompt feeds into the asset ingestor:
 │  │                                                    │ │
 │  │  ┌──────────────────────────────────────────┐  │ │
 │  │  │ Asset Ingestor                           │  │ │
-│  │  │ ├─ ComponentExtractor (prompt→ops tree)  │  │ │
-│  │  │ ├─ TransformEngine (quad→biped, mirror)  │  │ │
-│  │  │ └─ RenderOp pipeline → JSON for GPU      │  │ │
+│  │  │ ├─ ComponentExtractor                    │  │ │
+│  │  │ ├─ TransformEngine                       │  │ │
+│  │  │ ├─ compile_to_ast() → validate_ast()     │  │ │
+│  │  │ └─ render_ast_to_json()                  │  │ │
+│  │  └──────────────────────────────────────────┘  │ │
+│  │                                                    │ │
+│  │  ┌──────────────────────────────────────────┐  │ │
+│  │  │ Verification Core                        │  │ │
+│  │  │ ├─ VerificationLoop (Phase 6)            │  │ │
+│  │  │ ├─ verify_path() / find_path()           │  │ │
+│  │  │ └─ StructuralError accumulator           │  │ │
 │  │  └──────────────────────────────────────────┘  │ │
 │  └──────────────────────────────────────────────────┘ │
 └──────────────────────────────────────────────────────┘
@@ -199,12 +301,12 @@ The same compound prompt feeds into the asset ingestor:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode (valence), GraphArena (nodes_with_highest_valence, get_valence, find_by_label, label_of), ActivationBuffer, Edge (STDP), FiringHistory, Neuromodulator, PredictionError, ConceptualFrame, 10 Relation types |
+| `semantic-graph` | GroundedNode (valence), GraphArena (verify_path, find_path, get_valence, set_valence, nodes_with_highest_valence, find_by_label, label_of), ActivationBuffer, Edge (STDP, contract, effective_contract, canonical_contract), FiringHistory, Neuromodulator, PredictionError, DataType, InvariantContract, StructuralError, ConceptualFrame, 10 Relation types |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer (JSON/text) |
-| `cognitive-core` | ActivationEngine (4-phase tick), EventChannel, CognitiveDaemon, Consolidation |
+| `cognitive-core` | ActivationEngine (6-phase tick: neuromodulator decay / prediction error / spread+eligibility / STDP+pruning / valence update / structural verification), VerificationLoop (energy conservation, path integrity, penalties), EventChannel, CognitiveDaemon, Consolidation |
 | `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge |
 | `curiosity-core` | Gap detection, offline knowledge resolution, async harvester |
-| `asset-ingestor` | Prompt decomposition, quadruped→biped transform, render ops |
+| `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (compile_to_ast / validate_ast / render_ast_to_json) |
 | `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
 ## Status
@@ -212,17 +314,16 @@ The same compound prompt feeds into the asset ingestor:
 **Active development.** All crates have unit tests. The architecture is solid, but this is version 0.1 — a baby learning to crawl.
 
 - [x] Semantic graph with arena allocation + double-buffered activation
-- [x] 4-phase spreading activation (decay/inject/spread/fire)
+- [x] 6-phase spreading activation (decay/inject/spread/fire/valence/verify)
 - [x] 30+ verb→CD action mappings
-- [x] 4-phase tick: neuromodulator decay → prediction error → spread + eligibility → STDP + pruning
 - [x] Hebbian STDP: dynamic_edge_weight, eligibility traces, LTP on co-firing, LTD drift, pruning
 - [x] Neuromodulation: novelty, arousal, reward channels with per-tick decay and global threshold/plasticity modulation
 - [x] Predictive coding: activation predictions, |error| > 30% novelty spike
 - [x] Sleep consolidation: edge GC, linear chain compression
 - [x] Lock-free SPSC event channel (128 slots)
 - [x] Self node: `NodeId::SELF` (index 1) pre-inserted in every graph with base activation 1.0, decay 1.0 (never decays)
-- [x] Self-linking: every sensor reading, intent, and fired action anchors to SELF via `link_to_self()` — SELF never dies
-- [x] `introspect()` — returns everything SELF is connected to. The engine answers "what do I know?" by traversing edges from itself
+- [x] Self-linking: every sensor reading, intent, and fired action anchors to SELF via `link_to_self()`
+- [x] `introspect()` — returns everything SELF is connected to
 - [x] Self persists across restarts (serialized as node index 1 in bincode)
 - [x] Default Mode Network: spontaneous inner activity when idle, curiosity drive, inner monologue
 - [x] Valence system: nodes accumulate positive/negative experience from prediction success/failure
@@ -236,6 +337,9 @@ The same compound prompt feeds into the asset ingestor:
 - [x] Quadruped→biped geometric transform
 - [x] UniFFI bridge to Kotlin
 - [x] Android ForegroundService with wakelock + keepalive watchdog
+- [x] **Edge invariants**: `InvariantContract`, `DataType`, `StructuralError`, `Edge.contract`, `canonical_contract()`, `verify_path()`, `find_path()`
+- [x] **AST-driven pipeline**: `RenderAst` enum, `compile_to_ast()`, `validate_ast()`, `render_ast_to_json()` — all render ops compile through validated AST
+- [x] **Runtime verification**: `VerificationLoop` (Phase 6), energy conservation check, path integrity, novelty/valence/edge penalties on fault, `ActivationEngine.structural_faults`
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity with self node intact
 - [ ] Integration: prompt → render ops → wgpu draws skeleton
@@ -252,8 +356,9 @@ The same compound prompt feeds into the asset ingestor:
 | **Learning** | Pre-trained on all of internet | Grows through interaction |
 | **Size** | GB–TB | KB–MB |
 | **Honesty** | Hallucinates constantly | Can only traverse what it knows |
+| **Self-correction** | Fine-tuning / RLHF | Structural errors spike deviation gain and drop valence automatically |
 
-Grounded doesn't guess. It traverses what it knows. When it doesn't know something, it *knows* it doesn't know — that's a knowledge gap, and it resolves it. Ask it the same thing next week and it may have a better answer.
+Grounded doesn't guess. It traverses what it knows. When it doesn't know something, it *knows* it doesn't know — that's a knowledge gap, and it resolves it. When the graph violates its own structural rules, the verification loop makes it hurt. Ask it the same thing next week and it may have a better answer.
 
 ## Build
 

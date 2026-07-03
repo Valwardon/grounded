@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use semantic_graph::prelude::*;
+use crate::{VerificationLoop, VerificationEvent};
 
 // ────────────────────────────────────────────────────────────
 //  Spreading activation engine — STDP + neuromodulation edition
@@ -60,6 +61,10 @@ pub struct ActivationEngine {
     /// Prediction errors detected this tick (consumed by daemon after tick).
     pub prediction_errors: Vec<PredictionError>,
 
+    // ── Structural verification ──
+    /// Faults detected by the verification loop during the last tick.
+    pub structural_faults: Vec<VerificationEvent>,
+
     // ── Staging arrays (pre-allocated, zero alloc in hot path) ──
     /// Which nodes fired this tick (bitset, parallel to firing_history words)
     fired_this_tick: Vec<u64>,
@@ -76,6 +81,7 @@ impl ActivationEngine {
             firing_history: FiringHistory::new(len),
             predictions: vec![0.0; len],
             prediction_errors: Vec::with_capacity(4),
+            structural_faults: Vec::with_capacity(2),
             fired_this_tick: vec![0; words.max(1)],
             ctx,
         }
@@ -106,6 +112,7 @@ impl ActivationEngine {
     pub fn tick(&mut self) -> &[FiredAction] {
         self.fired.clear();
         self.prediction_errors.clear();
+        self.structural_faults.clear();
         self.ctx.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let graph = self.ctx.graph.read();
@@ -184,6 +191,12 @@ impl ActivationEngine {
             activations[i] = a;
         }
 
+        // ── Measure total energy before spread (for conservation check) ──
+        let mut energy_before_spread: f64 = 0.0;
+        for i in 1..node_count {
+            energy_before_spread += activations[i].abs();
+        }
+
         // ──────────────────────────────────────────────────
         //  Phase 3 — Spreading activation + eligibility
         // ──────────────────────────────────────────────────
@@ -234,6 +247,12 @@ impl ActivationEngine {
                 activations[target_idx] += spread_energy;
                 activations[i] -= spread_energy; // conservation
             }
+        }
+
+        // ── Measure total energy after spread (for conservation check) ──
+        let mut energy_after_spread: f64 = 0.0;
+        for i in 1..node_count {
+            energy_after_spread += activations[i].abs();
         }
 
         // ── Compute next-tick predictions from current activation levels ──
@@ -347,6 +366,39 @@ impl ActivationEngine {
 
         // SELF baseline: slow drift toward positive
         graph.update_valence(NodeId::SELF, 0.5, 0.001);
+
+        // ── Phase 6 — Structural verification ──
+        let fired_chain: Vec<NodeId> = self.fired.iter().map(|f| f.node_id).collect();
+        self.structural_faults = VerificationLoop::verify(
+            &self.ctx,
+            &mut self.modulators,
+            energy_before_spread,
+            energy_after_spread,
+            &fired_chain,
+        );
+
+        // Penalize valence on nodes involved in structural faults
+        for fault in &self.structural_faults {
+            if let VerificationEvent::StructuralFault { ref error, ref penalties } = fault {
+                for action in &self.fired {
+                    graph.update_valence(action.node_id, -penalties.valence_drop, 0.1);
+                }
+                match error {
+                    StructuralError::ContractMismatch { source, target, .. } => {
+                        // Mark the offending edge for pruning
+                        if let Some(node) = graph.get(*source) {
+                            let mut n = node.write();
+                            for edge in &mut n.edges {
+                                if edge.target == *target {
+                                    edge.dynamic_weight = 0.0;
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // ── Advance firing history ring buffer ──
         self.firing_history.advance_tick();

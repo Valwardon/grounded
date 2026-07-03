@@ -79,14 +79,12 @@ impl DefinitionResolver {
         // Link to parent if provided
         if let Some(parent) = parent_node {
             if let Some(parent_node) = graph.get(parent) {
-                parent_node
+                    parent_node
                     .write()
                     .edges
-                    .push(Edge {
-                        relation: Relation::AssociatedWith,
-                        target: main_id,
-                        weight_override: None,
-                    });
+                    .push(
+                        Edge::new(Relation::AssociatedWith, main_id),
+                    );
             }
         }
 
@@ -117,11 +115,9 @@ impl DefinitionResolver {
 
             // Add edge from main node to object
             if let Some(main_node) = graph.get(main_id) {
-                main_node.write().edges.push(Edge {
-                    relation: pred.relation,
-                    target: object_id,
-                    weight_override: None,
-                });
+                main_node.write().edges.push(
+                    Edge::new(pred.relation, object_id),
+                );
             }
         }
 
