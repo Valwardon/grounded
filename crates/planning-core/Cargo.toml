@@ -1,0 +1,12 @@
+[package]
+name = "planning-core"
+version = "0.1.0"
+edition = "2024"
+description = "Hierarchical planner + foresight engine + value system for grounded AGI"
+
+[dependencies]
+semantic-graph = { path = "../semantic-graph" }
+cognitive-core = { path = "../cognitive-core" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true

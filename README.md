@@ -468,6 +468,7 @@ After every tick's valence update:
 | `curiosity-core` | Gap detection, **CCG-based DefinitionResolver**, async harvester, **CuriosityBudget** (energy-aware, replaces depth 10) |
 | `metacognition` | **Self-healing pipeline**: `DeficiencyScanner` (constraint violation detection), `CandidateModule` DSL (18 safe opcodes, bytecode interpreter), `SwapSlot` lock-free double-buffer hot-swap, 5-phase `SelfHealingPipeline` (Generation → Contract Verification → Regression Testing → Ecological Benchmarking → Hot-Swap), `MetacognitiveCuriosity` (internal budget routing) |
 | `episodic-memory` | **Episodic timeline**: lock-free SPSC ring buffer (1024 × 64 bytes) for hot-path event recording, idle-cycle consolidation into `NodeType::Episode` graph nodes linked to SELF via `Relation::Experienced`, query API for tick-range / node-label / recent-N retrieval |
+| `planning-core` | **Hierarchical planner + foresight + values**: `HierarchicalPlanner` (goal→subgoal decomposition via `SubGoalOf`, action-tree expansion, plan selection by cost/confidence), `ForesightEngine` (chain-strength analysis, per-action symbolic simulation, parallel `NodeType::Simulation` branches with confidence pruning), `ValueSystem` (6 hardwired drives + 6 value categories + long-term goals + `DriveHook` tick injection for persistent activation bias) |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json, **effector math** (GravityVector, PaletteInterpolator, SkeletalTransformMatrix), **TransformEngine** (sensor→effector) |
 | `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
@@ -513,6 +514,10 @@ After every tick's valence update:
 - [x] **Predictive-role abstraction**: two-pass category synthesis (edge-signature + 2-hop predictive profile clustering at 70% overlap, terminal node extraction)
 - [x] **Self-healing metacognition**: DeficiencyScanner + 5-phase pipeline + DSL bytecode (18 opcodes) + SwapSlot lock-free hot-swap + metacognitive curiosity divert (wired end-to-end via `CuriosityHook` trait in cognitive-core, implemented by `MetacognitiveCuriosity`, called in idle consolidation and DMN curiosity drive)
 - [x] **Unified episodic memory**: lock-free SPSC ring buffer (1024 × 64 bytes), 5 event types (firing/prediction-error/fault/sensor/intent), idle-cycle graph consolidation as `NodeType::Episode` nodes linked to SELF via `Relation::Experienced`, tick-range / node-label / recent-N query API
+- [x] **Hierarchical planning engine**: `HierarchicalPlanner` in `planning-core` (goal decomposition, action-tree expansion, plan selection, mid-loop replanning on prediction error)
+- [x] **Cross-modal sensor fusion**: `CrossModalRegistry` in cognitive-core binding sensor channels to semantic concept nodes; `SensorMapper::cross_modal_inject()` in Phase 2 of every tick
+- [x] **Foresight engine**: `ForesightEngine` in `planning-core` (chain strength analysis, per-action symbolic simulation, parallel branches with confidence pruning)
+- [x] **Intrinsic value system**: `ValueSystem` in `planning-core` (6 hardwired drives + 6 value categories + long-term goals + `DriveHook` tick injection)
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
 

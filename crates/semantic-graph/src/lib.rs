@@ -204,6 +204,18 @@ pub enum Relation {
     /// Links SELF to an Episode node — "I experienced this event."
     /// Used by the episodic memory system for timeline recollection.
     Experienced,
+    /// Goal A is a sub-goal of Goal B (hierarchical decomposition).
+    SubGoalOf,
+    /// Node is a step in a plan's action sequence.
+    StepInPlan,
+    /// Simulation branch relationship — what-if scenario.
+    Simulates,
+    /// A drive or value influences a node's activation energy.
+    Drives,
+    /// An action or plan achieves a goal.
+    Achieves,
+    /// One goal blocks or conflicts with another.
+    Blocks,
 }
 
 impl Relation {
@@ -221,6 +233,12 @@ impl Relation {
             Relation::AssociatedWith => 0.3,
             Relation::SupportsBelief => 0.6,
             Relation::Experienced => 0.8,
+            Relation::SubGoalOf => 0.9,
+            Relation::StepInPlan => 0.85,
+            Relation::Simulates => 0.6,
+            Relation::Drives => 0.7,
+            Relation::Achieves => 0.8,
+            Relation::Blocks => -0.7,
         }
     }
 
@@ -255,6 +273,15 @@ impl Relation {
                 input_type: DataType::State,
             },
             Relation::Experienced => InvariantContract::Unspecified,
+            Relation::SubGoalOf => InvariantContract::Taxonomic,
+            Relation::StepInPlan => InvariantContract::Causal,
+            Relation::Simulates => InvariantContract::Unspecified,
+            Relation::Drives => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::Achieves => InvariantContract::Causal,
+            Relation::Blocks => InvariantContract::Causal,
         }
     }
 }
@@ -286,6 +313,41 @@ impl SensorNorm {
 //  Grounded concept mapping
 // ────────────────────────────────────────────────────────────
 
+/// Status of a goal in the planning hierarchy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum GoalStatus {
+    Active, InProgress, Completed, Failed, Blocked, Abandoned,
+}
+
+/// Status of a plan's execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlanStatus {
+    Pending, Executing, Paused, Succeeded, Failed,
+}
+
+/// Types of hardwired intrinsic drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum DriveType {
+    /// Explore unknown concepts (existing curiosity drive).
+    Curiosity,
+    /// Seek safety — avoid high prediction error states.
+    Safety,
+    /// Seek mastery — minimize long-term prediction error.
+    Mastery,
+    /// Seek social/feedback from the environment.
+    Affiliation,
+    /// Seek novelty and variety.
+    Exploration,
+    /// Conserve energy — minimize expensive operations.
+    Conservation,
+}
+
+/// Categories of global values shaping long-term behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ValueCategory {
+    Knowledge, Safety, Efficiency, Novelty, Stability, Growth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Grounding {
     Sensor { sensor_type: String, channel: u8, norm: SensorNorm },
@@ -304,6 +366,36 @@ pub enum Grounding {
     /// a rendering parameter (scale, rotation, color, wireframe).
     VisualPrimitive {
         primitive_type: VisualPrimitiveType,
+    },
+    /// Goal node — a target state the system aims to achieve.
+    /// priority: 0.0 (casual) to 1.0 (critical).
+    /// deadline_tick: tick by which this goal should be achieved (0 = no deadline).
+    Goal {
+        priority: f64,
+        deadline_tick: u64,
+        status: GoalStatus,
+    },
+    /// Plan node — a sequence of steps toward a goal.
+    Plan {
+        status: PlanStatus,
+        current_step: u64,
+    },
+    /// Foresight simulation branch — a parallel "what-if" timeline.
+    /// confidence: how reliable the simulation is (0.0–1.0).
+    /// horizon: how many ticks ahead the simulation extends.
+    Simulation {
+        confidence: f64,
+        horizon: u64,
+    },
+    /// Hardwired intrinsic drive — shapes activation energy landscape.
+    Drive {
+        drive_type: DriveType,
+        intensity: f64,
+    },
+    /// Global value — long-term preference weighting.
+    Value {
+        weight: f64,
+        category: ValueCategory,
     },
     /// Episodic memory record — a lived event in the system's timeline.
     /// tick: global tick counter when the event occurred.
@@ -418,6 +510,15 @@ pub struct GroundedNode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeType {
     Entity, Concept, Action, Sensor, State, Frame, VisualPrimitive, Episode,
+    /// A goal node for hierarchical planning.
+    /// Linked via SubGoalOf edges for decomposition.
+    Goal,
+    /// A sequence of steps to achieve a goal.
+    Plan,
+    /// A hardwired drive or value shaping activation energy.
+    Value,
+    /// A foresight simulation branch — parallel "what-if" timeline.
+    Simulation,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -1915,7 +2016,7 @@ pub mod prelude {
     };
     pub use super::{
         Neuromodulator, FiringHistory, PredictionError,
-        MotorCommandType,
+        MotorCommandType, GoalStatus, PlanStatus, DriveType, ValueCategory,
         LTP_WINDOW, ELIGIBILITY_DECAY, LTP_RATE, DRIFT_RATE,
         PRUNE_THRESHOLD, PREDICTION_ERROR_THRESHOLD,
     };

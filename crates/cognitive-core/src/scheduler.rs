@@ -86,6 +86,17 @@ pub enum EpisodicEvent {
     },
 }
 
+/// Hook for drive-based activation injection.
+///
+/// Called every tick with the current neuromodulator state.
+/// Returns activation biases to inject into the graph.
+/// Implemented by planning_core::values::ValueSystem.
+pub trait DriveHook: Send {
+    /// Update drive intensities based on modulators and
+    /// return (node_id, activation_amount) pairs to inject.
+    fn drive_biases(&mut self, novelty: f64, arousal: f64, reward: f64) -> Vec<(NodeId, f64)>;
+}
+
 /// Hook for metacognitive curiosity budget diversion.
 ///
 /// During idle consolidation cycles, the cognitive daemon checks
@@ -247,6 +258,14 @@ pub struct CognitiveDaemon {
     /// When active, routes curiosity budget to internal self-healing
     /// instead of external gap resolution.
     curiosity_hook: parking_lot::Mutex<Option<Box<dyn CuriosityHook>>>,
+
+    /// Cross-modal binding registry for sensor→concept fusion.
+    /// Populated at startup with default bindings.
+    cross_modal_registry: Option<CrossModalRegistry>,
+
+    /// Optional drive hook for intrinsic motivation bias injection.
+    /// Called every tick to inject drive-based activation.
+    drive_hook: parking_lot::Mutex<Option<Box<dyn DriveHook>>>,
 }
 
 impl CognitiveDaemon {
@@ -278,6 +297,8 @@ impl CognitiveDaemon {
             self_healing_hook: parking_lot::Mutex::new(None),
             episodic_recorder: parking_lot::Mutex::new(None),
             curiosity_hook: parking_lot::Mutex::new(None),
+            cross_modal_registry: Some(CrossModalRegistry::new()),
+            drive_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -401,6 +422,22 @@ impl CognitiveDaemon {
     /// instead of external gap resolution during idle cycles.
     pub fn set_curiosity_hook(&self, hook: Box<dyn CuriosityHook>) {
         *self.curiosity_hook.lock() = Some(hook);
+    }
+
+    /// Attach a drive hook for intrinsic motivation bias injection.
+    /// Called every tick with neuromodulator state; injects drive-based activation.
+    pub fn set_drive_hook(&self, hook: Box<dyn DriveHook>) {
+        *self.drive_hook.lock() = Some(hook);
+    }
+
+    /// Replace the cross-modal fusion registry.
+    pub fn set_cross_modal_registry(&mut self, registry: CrossModalRegistry) {
+        self.cross_modal_registry = Some(registry);
+    }
+
+    /// Access the cross-modal registry for inspection.
+    pub fn cross_modal_registry(&self) -> Option<&CrossModalRegistry> {
+        self.cross_modal_registry.as_ref()
     }
 
     /// Set the cognitive mode for the next tick.
@@ -542,6 +579,16 @@ impl CognitiveDaemon {
 
                 // ── Default Mode Network: spontaneous inner activity ──
                 self.run_default_mode_network(&mut engine, &fired);
+
+                // ── Intrinsic motivation: inject drive-based activation biases ──
+                // Each drive (curiosity, safety, mastery, etc.) contributes a small
+                // activation bias to shape the energy landscape toward long-term values.
+                if let Some(ref mut hook) = *self.drive_hook.lock() {
+                    let biases = hook.drive_biases(mod_n, mod_a, mod_r);
+                    for (node_id, amount) in biases {
+                        engine.inject(node_id, amount);
+                    }
+                }
             }
 
             // ── Episodic recording (events from this tick) ──
@@ -714,6 +761,20 @@ impl CognitiveDaemon {
                         }
                     }
                     _ => {}
+                }
+
+                // ── Cross-modal fusion: inject into semantically related concepts ──
+                // Sensor readings don't just drive visual primitives — they also
+                // constrain semantic concept nodes, bridging perception and reasoning.
+                if let Some(ref registry) = self.cross_modal_registry {
+                    let graph = self.ctx.graph.read();
+                    let targets = SensorMapper::cross_modal_inject(
+                        &sensor, channel, value, registry, &graph,
+                    );
+                    drop(graph);
+                    for (node_id, injection) in targets {
+                        engine.inject(node_id, injection);
+                    }
                 }
 
                 // ── Variance detection for prediction error → novelty ──

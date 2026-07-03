@@ -1,4 +1,86 @@
+use std::sync::Arc;
+use parking_lot::RwLock;
 use semantic_graph::prelude::*;
+
+// ────────────────────────────────────────────────────────────
+//  Cross-Modal Binding Registry
+//
+//  Links sensor channels to semantic concepts, enabling:
+//    - Sensor → Concept: sensor readings inject activation into
+//      semantically related nodes (perception constrains reasoning).
+//    - Concept → Sensor: semantic predictions produce expected
+//      sensor values (reasoning predicts perception).
+//
+//  This is the core of cross-modal fusion (AGI Req 8).
+// ────────────────────────────────────────────────────────────
+
+/// A binding between a sensor channel and a semantic concept node.
+/// When the sensor fires, activation is injected into the concept.
+/// When the concept fires, an expected sensor value is predicted.
+#[derive(Debug, Clone)]
+pub struct CrossModalBinding {
+    /// Sensor identifier (e.g. "accelerometer").
+    pub sensor: String,
+    /// Channel within the sensor.
+    pub channel: u8,
+    /// Label of the target concept node in the semantic graph.
+    pub concept_label: String,
+    /// Weight of the cross-modal connection (0.0–1.0).
+    pub weight: f64,
+    /// Whether this binding is bidirectional (sensor↔concept).
+    pub bidirectional: bool,
+}
+
+/// Registry of all cross-modal bindings.
+/// Populated at startup with default bindings; extensible at runtime.
+pub struct CrossModalRegistry {
+    bindings: Vec<CrossModalBinding>,
+}
+
+impl CrossModalRegistry {
+    pub fn new() -> Self {
+        // Default bindings: common sensor→concept mappings
+        let bindings = vec![
+            CrossModalBinding {
+                sensor: "accelerometer".into(),
+                channel: 0,
+                concept_label: "concept_movement".into(),
+                weight: 0.5,
+                bidirectional: true,
+            },
+            CrossModalBinding {
+                sensor: "proximity".into(),
+                channel: 0,
+                concept_label: "concept_proximity".into(),
+                weight: 0.6,
+                bidirectional: true,
+            },
+            CrossModalBinding {
+                sensor: "light".into(),
+                channel: 0,
+                concept_label: "concept_darkness".into(),
+                weight: 0.7,
+                bidirectional: true,
+            },
+        ];
+        CrossModalRegistry { bindings }
+    }
+
+    /// Find bindings for a given sensor+channel.
+    pub fn bindings_for(&self, sensor: &str, channel: u8) -> Vec<&CrossModalBinding> {
+        self.bindings.iter().filter(|b| b.sensor == sensor && b.channel == channel).collect()
+    }
+
+    /// All bindings.
+    pub fn all(&self) -> &[CrossModalBinding] {
+        &self.bindings
+    }
+
+    /// Add a new binding at runtime.
+    pub fn add_binding(&mut self, binding: CrossModalBinding) {
+        self.bindings.push(binding);
+    }
+}
 
 // ────────────────────────────────────────────────────────────
 //  SensorMapper — stateless fixed-point sensor→activation mapper
@@ -6,6 +88,9 @@ use semantic_graph::prelude::*;
 //  Converts raw hardware sensor readings into activation injection
 //  targets for visual primitive nodes. Used during Phase 2 (Injection)
 //  of the cognitive tick.
+//
+//  Extended with cross-modal fusion: sensor readings also inject
+//  into semantically related concept nodes via CrossModalRegistry.
 //
 //  All math is deterministic fixed-point (f64). No random numbers.
 //  No heap allocations.
@@ -79,6 +164,45 @@ impl SensorMapper {
             (NodeId::from_raw(VISUAL_COLOR_CHROMA), Self::map_light(lux)),
             (NodeId::from_raw(VISUAL_SPATIAL_SCALE), Self::map_light_to_scale(lux)),
         ]
+    }
+
+    /// Apply cross-modal binding: map a sensor reading to activation
+    /// injection into semantically related concept nodes.
+    ///
+    /// Uses the CrossModalRegistry to find bindings, then looks up
+    /// the target concept node in the graph and returns injection targets.
+    pub fn cross_modal_inject(
+        sensor: &str,
+        channel: u8,
+        raw_value: f32,
+        registry: &CrossModalRegistry,
+        graph: &GraphArena,
+    ) -> Vec<(NodeId, f64)> {
+        let mut targets: Vec<(NodeId, f64)> = Vec::new();
+        let bindings = registry.bindings_for(sensor, channel);
+        for binding in bindings {
+            if let Some(id) = graph.lookup(&binding.concept_label) {
+                let inject = (raw_value as f64) * binding.weight * MAX_SENSOR_INJECT;
+                targets.push((id, inject.clamp(0.0, MAX_SENSOR_INJECT)));
+            }
+        }
+        targets
+    }
+
+    /// Predict expected sensor value from concept node activation.
+    /// Inverse of cross_modal_inject: given a concept's activation,
+    /// what sensor value would we expect?
+    ///
+    /// Returns None if no binding exists for this sensor/channel.
+    pub fn predict_sensor_from_concept(
+        concept_activation: f64,
+        binding: &CrossModalBinding,
+    ) -> Option<f64> {
+        if binding.weight > 0.0 {
+            Some((concept_activation / binding.weight).clamp(0.0, 1.0))
+        } else {
+            None
+        }
     }
 
     /// Detect sensor variance > 30% and compute prediction error magnitude.

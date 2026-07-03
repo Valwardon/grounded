@@ -2,9 +2,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
-use cognitive_core::{CognitiveDaemon, CuriosityHook, EpisodicRecorder, SelfHealingHook};
+use cognitive_core::{CognitiveDaemon, CuriosityHook, DriveHook, EpisodicRecorder, SelfHealingHook};
 use episodic_memory::EpisodicHistory;
 use metacognition::{SelfHealingPipeline, ModuleRegistry, Constraint, MetacognitiveCuriosity};
+use planning_core::{HierarchicalPlanner, ValueSystem};
 use semantic_graph::prelude::*;
 use crate::render_bridge::{RenderBridge, NullRenderBackend};
 
@@ -125,6 +126,32 @@ impl CognitiveLifecycle {
         // episodes into the semantic graph during idle cycles.
         let history = EpisodicHistory::new(ctx.clone());
         daemon.set_episodic_recorder(Box::new(history));
+
+        // ── Initialize the intrinsic value system (drives + long-term goals) ──
+        // Creates hardwired Drive and Value nodes in the semantic graph that
+        // inject persistent activation bias during each tick, shaping the
+        // energy landscape beyond raw curiosity toward long-term values.
+        let mut value_system = ValueSystem::new(ctx.clone());
+        value_system.add_long_term_goal("understand_environment", 0.8, ValueCategory::Knowledge);
+        value_system.add_long_term_goal("maintain_stability", 0.6, ValueCategory::Stability);
+        daemon.set_drive_hook(Box::new(value_system));
+
+        // ── Initialize the hierarchical planner + foresight engine ──
+        // Decomposes goals into action sequences, evaluates them via
+        // graph-based foresight simulation, and executes with mid-loop
+        // replanning on prediction error.
+        let planner = HierarchicalPlanner::new(ctx.clone());
+
+        // Register the intrinsic understanding goal
+        let goal_id = planner.goals().register_goal("understand_world", 0.7, 0);
+        // Build initial plan
+        let plan = planner.plan_for_goal(goal_id);
+        let plan_id = planner.materialize_plan(&plan);
+        let foresight_result = planner.foresight().simulate_action(goal_id);
+        eprintln!(
+            "[PLAN] Goal={} confidence={:.2} risk={:.2} steps={}",
+            goal_id.0, plan.confidence, foresight_result.risk_score, plan.steps.len(),
+        );
     }
 
     /// Start the cognitive background loop + render bridge.

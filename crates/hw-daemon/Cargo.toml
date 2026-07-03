@@ -11,6 +11,7 @@ parking_lot = { workspace = true }
 cognitive-core = { path = "../cognitive-core" }
 episodic-memory = { path = "../episodic-memory" }
 metacognition = { path = "../metacognition" }
+planning-core = { path = "../planning-core" }
 semantic-graph = { path = "../semantic-graph" }
 wgpu = { version = "22", optional = true }
 

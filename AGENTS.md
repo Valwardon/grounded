@@ -709,6 +709,30 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 
 ### hw-daemon lifecycle wiring (this session)
 - `lifecycle.rs:111-121` — pipeline is Boxed FIRST (heap-stable address), then metacuriosity is created + bound to the boxed pipeline via raw pointer, then hook attached to daemon, then pipeline_box moved into daemon's `SelfHealingHook`. This ordering ensures the raw pointer in `MetacognitiveBudgetAllocator` targets the heap address (stable after Box move).
+- `lifecycle.rs:130-145` — `ValueSystem` created (6 hardwired drives + 2 long-term goals "understand_environment" + "maintain_stability"), attached via `set_drive_hook()`. `HierarchicalPlanner` created, registers "understand_world" goal, builds initial plan, materializes it.
+
+### planning-core crate (new, this session)
+- `goal.rs` — `GoalResolver`: register/completes/fails goals, queries active goals by priority, checks subgoal completion. Uses `NodeType::Goal` + `Grounding::Goal { priority, deadline_tick, status }` in the semantic graph.
+- `planner.rs` — `HierarchicalPlanner`: `plan_for_goal()` scans `Achieves` edges from Action nodes to find ways to achieve a goal; if no direct action found, falls back to `SubGoalOf` decomposition. `select_best_plan()` scores plans by `confidence - cost*0.1`. `execute_step()` injects activation into step nodes. `should_replan()` checks if novelty+arousal exceed `replan_threshold` (0.3). `materialize_plan()` creates `NodeType::Plan` nodes linked to steps via `StepInPlan`.
+- `foresight.rs` — `ForesightEngine`: `evaluate_plan()` computes chain strength as fraction of adjacent steps with causal paths (direct edge or 2-hop). `simulate_action()` propagates activation through edges with decay, computes confidence from variance-weighted risk. `fork_branch()` creates `NodeType::Simulation` branches (max 3). `prune_branches()` clears edges on low-confidence branches.
+- `values.rs` — `ValueSystem`: 6 hardwired `DriveDef`s (Curiosity/Safety/Mastery/Affiliation/Exploration/Conservation) with dynamic intensities updated from neuromodulator state. 6 `ValueCategory` nodes (Knowledge/Safety/Efficiency/Novelty/Stability/Growth) with persistent weights. `add_long_term_goal()` creates `NodeType::Goal` nodes with priority. Implements `cognitive_core::DriveHook` for per-tick activation bias injection.
+
+### cognitive-core semantic-graph extensions (this session)
+- `NodeType::Goal`, `NodeType::Plan`, `NodeType::Value`, `NodeType::Simulation` — new node types for planning, values, and foresight.
+- `Relation::SubGoalOf` (0.9), `StepInPlan` (0.85), `Simulates` (0.6), `Drives` (0.7), `Achieves` (0.8), `Blocks` (-0.7) — new edge types for goal decomposition, plan execution, simulation branching, drive influence, goal achievement, and conflict.
+- `Grounding::Goal { priority, deadline_tick, status }`, `Grounding::Plan { status, current_step }`, `Grounding::Simulation { confidence, horizon }`, `Grounding::Drive { drive_type, intensity }`, `Grounding::Value { weight, category }` — new grounding variants.
+- `GoalStatus` (Active/InProgress/Completed/Failed/Blocked/Abandoned), `PlanStatus` (Pending/Executing/Paused/Succeeded/Failed), `DriveType` (Curiosity/Safety/Mastery/Affiliation/Exploration/Conservation), `ValueCategory` (Knowledge/Safety/Efficiency/Novelty/Stability/Growth) — new enums.
+
+### cognitive-core cross-modal fusion (this session)
+- `CrossModalBinding` — links sensor+channel to semantic concept label with weight and bidirectionality flag.
+- `CrossModalRegistry` — stores default bindings (accelerometer→movement, proximity→proximity, light→darkness) + `add_binding()` at runtime.
+- `SensorMapper::cross_modal_inject()` — given sensor reading + registry, returns (NodeId, activation) pairs for semantic concept nodes. Called in `CognitiveDaemon` sensor event handler after normal visual primitive injection (Phase 2 equivalent).
+- `SensorMapper::predict_sensor_from_concept()` — inverse: given concept activation + binding, returns expected sensor value.
+
+### cognitive-core DriveHook + wiring (this session)
+- `DriveHook` trait (`scheduler.rs`) — `drive_biases(novelty, arousal, reward) → Vec<(NodeId, f64)>`. Implemented by `planning_core::ValueSystem`.
+- `CognitiveDaemon::drive_hook` — `parking_lot::Mutex<Option<Box<dyn DriveHook>>>` field. `set_drive_hook()` setter.
+- Tick loop wiring (after DMN run, still inside engine lock): calls `drive_biases()` and injects returned activations.
 
 ## Critical Rules for Agent
 
@@ -734,3 +758,6 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 20. Counterfactual mode must short-circuit both Phase 4 (STDP) and Phase 5 (valence). Phase 3 and Phase 6 must still run normally. Do not skip event processing in counterfactual mode.
 21. Predictive-role profiles are bounded at 128 nodes. Never run unbounded BFS. Profile extraction uses a `Vec<u64>` frontier, not recursion.
 22. Episodic memory writes are lock-free SPSC only. The cognitive daemon (single writer) pushes `RawEpisodicRecord` to the ring buffer — no locks, no allocations. The consolidation pass (single reader, idle cycle) drains the buffer and promotes to the graph. Never read/write the ring buffer from multiple threads.
+23. Planning goals must be `NodeType::Goal` in the graph, linked via `Relation::SubGoalOf` for decomposition. Action nodes with `Relation::Achieves` edges to a goal are automatically discovered by `HierarchicalPlanner::plan_for_goal()`. Never create `Plan` nodes manually — always use `materialize_plan()`.
+24. Cross-modal bindings must be registered at startup via `CrossModalRegistry::new()` defaults. Runtime additions go through `add_binding()`. The registry is read-only during the tick loop — no modifications while the daemon is running.
+25. Drive intensities are updated every tick from neuromodulator state. Never hardcode `current_intensity` — always compute from `base_intensity + modulator_term`. The dominant drive (highest intensity) determines the overall behavioral bias.
