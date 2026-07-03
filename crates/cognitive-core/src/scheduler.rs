@@ -36,6 +36,9 @@ pub enum CognitiveEvent {
     Modulate { channel: String, amount: f64 },
     /// Trigger offline consolidation pass
     Consolidate,
+    /// Render feedback: actual render state hash for comparison against prediction.
+    /// Used by the unified cognitive-render loop to generate reward/novelty signals.
+    RenderFeedback { effector_label: String, actual_hash: u64 },
     Shutdown,
     Pause,
     Resume,
@@ -46,6 +49,14 @@ pub enum CognitiveOutput {
     AndroidIntent { json: String },
     UpdateUi { json: String },
     LogMessage { level: u8, text: String },
+    /// Render command from the motor effector system.
+    /// The renderer should execute this and feed back the result via
+    /// ActivationEngine::process_render_feedback().
+    RenderCommand {
+        command_type: String,
+        target: String,
+        parameters: Vec<f64>,
+    },
 }
 
 /// Lock-free SPSC channel for events.
@@ -301,7 +312,7 @@ impl CognitiveDaemon {
                     self.ctx.link_to_self(Relation::CausedBy, action.node_id);
                 }
 
-                // ── Dispatch fired actions ──
+                // ── Dispatch fired actions + render commands ──
                 let mut outputs = self.output_channel.write();
                 for action in &fired {
                     match &action.grounding {
@@ -325,6 +336,13 @@ impl CognitiveDaemon {
                                 ),
                             });
                         }
+                        Grounding::MotorCommand { command_type, target, parameters } => {
+                            outputs.push(CognitiveOutput::RenderCommand {
+                                command_type: command_type.label().to_string(),
+                                target: target.clone(),
+                                parameters: parameters.clone(),
+                            });
+                        }
                         _ => {
                             outputs.push(CognitiveOutput::LogMessage {
                                 level: 1,
@@ -335,6 +353,15 @@ impl CognitiveDaemon {
                             });
                         }
                     }
+                }
+
+                // ── Dispatch render commands (from effector nodes) ──
+                for cmd in &engine.pending_render_commands {
+                    outputs.push(CognitiveOutput::RenderCommand {
+                        command_type: cmd.command_type.label().to_string(),
+                        target: cmd.target.clone(),
+                        parameters: cmd.parameters.clone(),
+                    });
                 }
 
                 // ── Default Mode Network: spontaneous inner activity ──
@@ -446,6 +473,10 @@ impl CognitiveDaemon {
                         text: format!("Consolidation: pruned {} edges", pruned),
                     });
                 }
+            }
+            CognitiveEvent::RenderFeedback { effector_label, actual_hash } => {
+                let mut engine = self.engine.lock();
+                engine.process_render_feedback(&effector_label, actual_hash);
             }
         }
     }

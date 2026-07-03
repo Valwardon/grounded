@@ -1,6 +1,110 @@
 use semantic_graph::prelude::*;
 
 // ────────────────────────────────────────────────────────────
+//  CuriosityBudget — energy-aware curiosity model
+//
+//  Replaces the hard recursion depth cap (MAX_RECURSION_DEPTH=10)
+//  with an energy pool $E_{curious}$ that depletes as the system
+//  explores. Each recursive step consumes energy proportional to:
+//
+//    E_consume = alpha * dist(SELF, concept) + beta * arousal + gamma * error_rate
+//
+//  Where:
+//    alpha = 0.3 (semantic distance weight)
+//    beta  = 0.4 (arousal weight — high arousal clamps search)
+//    gamma = 0.2 (structural error weight)
+//
+//  Halt when E_remaining falls below dynamic threshold:
+//    threshold = novelty * 0.15  (high novelty = more exploration)
+//
+//  This allows infinite depth for novel/rewarding concepts while
+//  naturally truncating low-value branches.
+// ────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy)]
+pub struct CuriosityBudget {
+    /// Total energy pool allocated for this curiosity chain.
+    pub total_energy: f64,
+    /// Remaining energy.
+    pub remaining: f64,
+    /// Accumulated structural errors in this chain.
+    pub error_count: u64,
+}
+
+impl CuriosityBudget {
+    /// Create a new budget with a given total energy.
+    pub fn new(total_energy: f64) -> Self {
+        CuriosityBudget {
+            total_energy,
+            remaining: total_energy,
+            error_count: 0,
+        }
+    }
+
+    /// Default budget: 10.0 units (enough for ~10-20 steps).
+    pub fn default() -> Self {
+        CuriosityBudget::new(10.0)
+    }
+
+    /// Compute energy cost for one recursive step.
+    ///
+    /// Parameters:
+    ///   semantic_distance: distance from SELF to the target concept (0.0-5.0)
+    ///   arousal: global arousal level (0.0-1.0)
+    ///   novelty: global novelty level (0.0-1.0) — acts as discount
+    pub fn step_cost(&self, semantic_distance: f64, arousal: f64, novelty: f64) -> f64 {
+        let alpha = 0.3;
+        let beta = 0.4;
+        let gamma = 0.2;
+
+        let error_rate = if self.total_energy > 0.0 {
+            self.error_count as f64 / self.total_energy
+        } else {
+            0.0
+        };
+
+        let base = alpha * semantic_distance.min(5.0) / 5.0
+            + beta * arousal
+            + gamma * error_rate.min(1.0);
+
+        // Novelty discounts energy cost — high novelty = cheaper exploration
+        let discount = 1.0 - novelty * 0.3;
+
+        (base * discount * 0.5).clamp(0.05, 2.0)
+    }
+
+    /// Dynamic halt threshold: the minimum energy required to continue.
+    /// High novelty lowers the threshold (allows deeper search).
+    pub fn halt_threshold(&self, novelty: f64) -> f64 {
+        (novelty * 0.15).clamp(0.01, 0.5)
+    }
+
+    /// Consume energy for one step. Returns false if budget is exhausted.
+    pub fn consume(&mut self, semantic_distance: f64, arousal: f64, novelty: f64) -> bool {
+        let cost = self.step_cost(semantic_distance, arousal, novelty);
+        if self.remaining - cost < self.halt_threshold(novelty) {
+            return false;
+        }
+        self.remaining -= cost;
+        true
+    }
+
+    /// Record an error that increases future step costs.
+    pub fn record_error(&mut self) {
+        self.error_count += 1;
+    }
+
+    /// Ratio of remaining energy (0.0 = empty, 1.0 = full).
+    pub fn ratio(&self) -> f64 {
+        if self.total_energy > 0.0 {
+            (self.remaining / self.total_energy).clamp(0.0, 1.0)
+        } else {
+            0.0
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────
 //  Knowledge Gap detection
 //
 //  The core principle: when a token has zero relational edges in
@@ -15,8 +119,8 @@ pub struct KnowledgeGap {
     pub token: String,
     /// The node that referenced this token (if any)
     pub parent_node_id: Option<NodeId>,
-    /// Recursion depth — circuit breaker at 10
-    pub recursion_depth: u8,
+    /// Curiosity budget — energy-aware exploration limit
+    pub budget: CuriosityBudget,
     /// How this gap was discovered
     pub source: GapSource,
 }
@@ -31,17 +135,22 @@ pub enum GapSource {
 }
 
 impl KnowledgeGap {
-    pub fn new(token: &str, depth: u8, source: GapSource) -> Self {
+    pub fn new(token: &str, source: GapSource) -> Self {
         KnowledgeGap {
             token: token.to_string(),
             parent_node_id: None,
-            recursion_depth: depth,
+            budget: CuriosityBudget::default(),
             source,
         }
     }
 
     pub fn with_parent(mut self, parent: NodeId) -> Self {
         self.parent_node_id = Some(parent);
+        self
+    }
+
+    pub fn with_budget(mut self, budget: CuriosityBudget) -> Self {
+        self.budget = budget;
         self
     }
 }
@@ -84,7 +193,7 @@ impl GapDetector {
                             gaps.push(KnowledgeGap {
                                 token: normalized,
                                 parent_node_id: Some(id),
-                                recursion_depth: 0,
+                                budget: CuriosityBudget::default(),
                                 source,
                             });
                         }
@@ -95,7 +204,7 @@ impl GapDetector {
                     gaps.push(KnowledgeGap {
                         token: normalized,
                         parent_node_id: None,
-                        recursion_depth: 0,
+                        budget: CuriosityBudget::default(),
                         source,
                     });
                 }

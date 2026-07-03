@@ -9,3 +9,4 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 semantic-graph = { path = "../semantic-graph" }
+semantic-parser = { path = "../semantic-parser" }

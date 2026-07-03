@@ -1,3 +1,5 @@
+pub mod relational;
+
 use semantic_graph::prelude::*;
 
 // ────────────────────────────────────────────────────────────

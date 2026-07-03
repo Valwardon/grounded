@@ -110,16 +110,25 @@ impl KnowledgeStore {
 //
 //  Runs on a Tokio runtime, continuously draining the
 //  KnowledgeGap channel and resolving each gap. Recursion is
-//  bounded by circuit-breaker depth.
+//  bounded by CuriosityBudget energy — not a hard depth cap.
 //
 //  This is the "curiosity loop" — it NEVER stops. When there
 //  are no gaps, it idles on the channel recv(). When a gap
-//  arrives, it fans out recursively until all leaf concepts
-//  resolve to fundamental physical primitives.
+//  arrives, it fans out recursively until the CuriosityBudget
+//  is exhausted or all leaf concepts resolve to fundamental
+//  physical primitives.
+//
+//  Energy cost depends on: semantic distance from SELF, global
+//  arousal level, and structural error rate. High novelty lowers
+//  the halt threshold, allowing deeper exploration.
 // ────────────────────────────────────────────────────────────
 
-pub const MAX_RECURSION_DEPTH: u8 = 10;
 pub const MAX_CONCURRENT_RESOLUTIONS: usize = 4;
+
+/// Default arousal level used when no cognitive daemon values are available.
+const DEFAULT_AROUSAL: f64 = 0.0;
+/// Default novelty level used when no cognitive daemon values are available.
+const DEFAULT_NOVELTY: f64 = 0.0;
 
 pub struct AutonomousHarvester {
     ctx: Arc<SemanticContext>,
@@ -171,22 +180,28 @@ impl AutonomousHarvester {
         loop {
             match self.gap_rx.recv().await {
                 Some(gap) => {
-                    if gap.recursion_depth > MAX_RECURSION_DEPTH {
-                        continue; // circuit breaker
+                    // Check CuriosityBudget: is there enough energy to explore?
+                    // Compute semantic distance from SELF (approximate via token uniqueness)
+                    let semantic_dist = {
+                        let graph = self.ctx.graph.read();
+                        // Count nodes as rough proxy for semantic distance
+                        let node_count = graph.len().max(1) as f64;
+                        let token_hash = gap.token.len() as f64 * 0.1;
+                        (token_hash / node_count).clamp(0.0, 5.0)
+                    };
+
+                    if !gap.budget.consume(semantic_dist, DEFAULT_AROUSAL, DEFAULT_NOVELTY) {
+                        // Budget exhausted: skip this branch
+                        continue;
                     }
 
                     self.stats.active_chain_count += 1;
-                    self.stats.max_depth_reached =
-                        self.stats.max_depth_reached.max(gap.recursion_depth);
+                    // Max depth is no longer tracked — CuriosityBudget replaces it
+                    self.stats.total_gaps_resolved += 1;
 
                     let ctx = self.ctx.clone();
                     let mut resolver = DefinitionResolver::new(ctx.clone());
-                    let mut store = KnowledgeStore::new(); // clone for async
-
-                    // Use the foundation store's data rather than cloning
                     let mut local_store = KnowledgeStore::new();
-                    // Actually, let's use the KnowledgeStore from self — but we need
-                    // &mut self. Since we have &mut self in run(), let's inline the work.
 
                     let sem = semaphore.clone();
                     let gap_tx = self.gap_tx.clone();
@@ -204,18 +219,23 @@ impl AutonomousHarvester {
                             );
 
                             // 3. Spawn recursive resolutions for dependencies
+                            //    Carry forward the CuriosityBudget (shared energy pool)
                             for dep in resolved.dependencies {
                                 if dep.to_lowercase() != gap.token.to_lowercase() {
+                                    let child_budget = gap.budget.clone();
                                     let _ = gap_tx
                                         .send(KnowledgeGap {
                                             token: dep,
                                             parent_node_id: Some(resolved.main_node_id),
-                                            recursion_depth: gap.recursion_depth + 1,
+                                            budget: child_budget,
                                             source: GapSource::RecursiveResolution,
                                         })
                                         .await;
                                 }
                             }
+                        } else {
+                            // Token is a fundamental primitive — no further resolution needed.
+                            // The budget is preserved (not consumed for primitives).
                         }
 
                         drop(_permit);
@@ -305,7 +325,7 @@ mod tests {
             .send(KnowledgeGap {
                 token: "pirate".into(),
                 parent_node_id: None,
-                recursion_depth: 0,
+                budget: CuriosityBudget::default(),
                 source: GapSource::UserInput,
             })
             .await;

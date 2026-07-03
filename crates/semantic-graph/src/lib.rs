@@ -243,7 +243,44 @@ pub enum Grounding {
     Action { intent_template: String },
     Stored { keyspace: String, key: String },
     HardwareQuery { query_type: String },
+    /// Motor effector command: directly maps to a RenderAst effector node.
+    /// The render pipeline executes this command and feeds visual results
+    /// back into the prediction error system.
+    MotorCommand {
+        command_type: MotorCommandType,
+        target: String,
+        parameters: Vec<f64>,
+    },
     Abstract,
+}
+
+/// Types of motor effector commands for the unified render loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum MotorCommandType {
+    DrawSkeleton,
+    ApplyTransform,
+    ApplyMesh,
+    Composite,
+    /// Spawn or reconfigure a visual element
+    Spawn,
+    /// Remove or disable a visual element
+    Despawn,
+    /// Query the current render state
+    QueryRenderState,
+}
+
+impl MotorCommandType {
+    pub fn label(&self) -> &'static str {
+        match self {
+            MotorCommandType::DrawSkeleton => "draw_skeleton",
+            MotorCommandType::ApplyTransform => "apply_transform",
+            MotorCommandType::ApplyMesh => "apply_mesh",
+            MotorCommandType::Composite => "composite",
+            MotorCommandType::Spawn => "spawn",
+            MotorCommandType::Despawn => "despawn",
+            MotorCommandType::QueryRenderState => "query_render_state",
+        }
+    }
 }
 
 // ────────────────────────────────────────────────────────────
@@ -937,6 +974,313 @@ impl ConceptualFrame {
 }
 
 // ────────────────────────────────────────────────────────────
+//  PrimitiveMatrix — algebraic bootstrapping schema
+//
+//  Every grounded concept is a 5-dimensional vector:
+//  [Mass, Velocity, Spatial, Valence, TemporalFrequency]
+//
+//  Base primitives (Matter, Motion, Energy, etc.) are pure
+//  unit vectors. Complex concepts are derived by vector
+//  combination: Speed + Mass = Momentum, Motion + Valence = Mood.
+//
+//  Edge contracts are derived dynamically from the dimensional
+//  composition of source and target vectors.
+// ────────────────────────────────────────────────────────────
+
+/// The 5 fundamental physical dimensions of any concept.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PrimitiveVector {
+    /// Mass / substance / material density (0.0 = immaterial, 1.0 = solid)
+    pub mass: f64,
+    /// Velocity / speed / rate of change (0.0 = static, 1.0 = fast)
+    pub velocity: f64,
+    /// Spatial extent / dimensionality (0.0 = point, 1.0 = voluminous)
+    pub spatial: f64,
+    /// Valence / affective charge (-1.0 = aversive, +1.0 = attractive)
+    pub valence: f64,
+    /// Temporal frequency / recurrence rate (0.0 = never, 1.0 = constant)
+    pub temporal: f64,
+}
+
+impl PrimitiveVector {
+    pub const fn new(mass: f64, velocity: f64, spatial: f64, valence: f64, temporal: f64) -> Self {
+        PrimitiveVector { mass, velocity, spatial, valence, temporal }
+    }
+
+    pub fn zero() -> Self {
+        PrimitiveVector { mass: 0.0, velocity: 0.0, spatial: 0.0, valence: 0.0, temporal: 0.0 }
+    }
+
+    /// Combine two vectors via weighted addition. The result inherits
+    /// dimensional properties from both parents.
+    pub fn combine(&self, other: &PrimitiveVector) -> Self {
+        PrimitiveVector {
+            mass: (self.mass + other.mass * 0.5).clamp(0.0, 1.0),
+            velocity: (self.velocity + other.velocity * 0.5).clamp(0.0, 1.0),
+            spatial: (self.spatial + other.spatial * 0.5).clamp(0.0, 1.0),
+            valence: (self.valence + other.valence * 0.5).clamp(-1.0, 1.0),
+            temporal: (self.temporal + other.temporal * 0.5).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Semantic distance between two vectors (Manhattan).
+    pub fn distance(&self, other: &PrimitiveVector) -> f64 {
+        (self.mass - other.mass).abs()
+            + (self.velocity - other.velocity).abs()
+            + (self.spatial - other.spatial).abs()
+            + (self.valence - other.valence).abs()
+            + (self.temporal - other.temporal).abs()
+    }
+
+    /// The dominant dimension (highest absolute value).
+    pub fn dominant(&self) -> &'static str {
+        let vals = [("mass", self.mass), ("velocity", self.velocity),
+            ("spatial", self.spatial), ("valence", self.valence.abs()), ("temporal", self.temporal)];
+        vals.iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(n, _)| *n).unwrap_or("mass")
+    }
+
+    /// Derive the default InvariantContract for an edge connecting
+    /// a source vector to a target vector. Based on dimensional overlap.
+    pub fn contract_between(source: &PrimitiveVector, target: &PrimitiveVector) -> InvariantContract {
+        let overlap = (source.mass * target.mass
+            + source.velocity * target.velocity
+            + source.spatial * target.spatial
+            + source.valence.abs() * target.valence.abs()
+            + source.temporal * target.temporal) / 5.0;
+        if overlap > 0.6 {
+            InvariantContract::DataFlow { output_type: DataType::Activation, input_type: DataType::Activation }
+        } else if source.spatial > 0.0 && target.spatial > 0.0 {
+            InvariantContract::Causal
+        } else if (source.valence - target.valence).abs() < 0.3 {
+            InvariantContract::Taxonomic
+        } else {
+            InvariantContract::Unspecified
+        }
+    }
+}
+
+/// Fundamental base primitives — unit vectors along each dimension.
+pub mod base_primitives {
+    use super::PrimitiveVector;
+
+    pub const MATTER:    PrimitiveVector = PrimitiveVector::new(1.0, 0.0, 0.5, 0.0, 0.0);
+    pub const MOTION:    PrimitiveVector = PrimitiveVector::new(0.0, 1.0, 0.0, 0.0, 0.5);
+    pub const DIMENSION: PrimitiveVector = PrimitiveVector::new(0.0, 0.0, 1.0, 0.0, 0.0);
+    pub const TIME:      PrimitiveVector = PrimitiveVector::new(0.0, 0.0, 0.0, 0.0, 1.0);
+    pub const ENERGY:    PrimitiveVector = PrimitiveVector::new(0.3, 0.8, 0.0, 0.0, 0.3);
+    pub const FORCE:     PrimitiveVector = PrimitiveVector::new(0.5, 0.5, 0.0, 0.0, 0.0);
+    pub const MASS:      PrimitiveVector = PrimitiveVector::new(1.0, 0.0, 0.3, 0.0, 0.0);
+    pub const LIGHT:     PrimitiveVector = PrimitiveVector::new(0.0, 1.0, 0.0, 0.2, 0.0);
+    pub const SOUND:     PrimitiveVector = PrimitiveVector::new(0.0, 0.5, 0.3, 0.1, 0.3);
+    pub const SOLID:     PrimitiveVector = PrimitiveVector::new(0.9, 0.0, 0.8, 0.0, 0.0);
+    pub const LIQUID:    PrimitiveVector = PrimitiveVector::new(0.6, 0.3, 0.6, 0.0, 0.0);
+    pub const GAS:       PrimitiveVector = PrimitiveVector::new(0.1, 0.7, 0.9, 0.0, 0.0);
+    pub const HOT:       PrimitiveVector = PrimitiveVector::new(0.2, 0.6, 0.2, -0.1, 0.2);
+    pub const COLD:      PrimitiveVector = PrimitiveVector::new(0.4, 0.1, 0.2, -0.2, 0.0);
+    pub const COLOR:     PrimitiveVector = PrimitiveVector::new(0.0, 0.0, 0.0, 0.5, 0.0);
+    pub const SHAPE:     PrimitiveVector = PrimitiveVector::new(0.2, 0.0, 0.9, 0.1, 0.0);
+    pub const BODY:      PrimitiveVector = PrimitiveVector::new(0.7, 0.2, 0.6, 0.1, 0.0);
+    pub const SURFACE:   PrimitiveVector = PrimitiveVector::new(0.3, 0.0, 0.8, 0.0, 0.0);
+    pub const EDGE:      PrimitiveVector = PrimitiveVector::new(0.1, 0.0, 0.7, 0.0, 0.0);
+    pub const CORNER:    PrimitiveVector = PrimitiveVector::new(0.1, 0.0, 0.6, 0.0, 0.0);
+    pub const UP:        PrimitiveVector = PrimitiveVector::new(0.0, 0.3, 0.5, 0.1, 0.0);
+    pub const DOWN:      PrimitiveVector = PrimitiveVector::new(0.3, 0.3, 0.5, -0.1, 0.0);
+    pub const BIG:       PrimitiveVector = PrimitiveVector::new(0.5, 0.0, 1.0, 0.2, 0.0);
+    pub const SMALL:     PrimitiveVector = PrimitiveVector::new(0.2, 0.0, 0.2, 0.0, 0.0);
+    pub const FAST:      PrimitiveVector = PrimitiveVector::new(0.0, 1.0, 0.0, 0.3, 0.5);
+    pub const SLOW:      PrimitiveVector = PrimitiveVector::new(0.2, 0.2, 0.0, 0.0, 0.3);
+
+    /// Derived vectors via combination. Speed+Mass = Momentum.
+    pub fn momentum() -> PrimitiveVector { MOTION.combine(&MASS) }
+    pub fn temperature() -> PrimitiveVector { HOT.combine(&COLD) }
+    pub fn texture() -> PrimitiveVector { SURFACE.combine(&MASS) }
+}
+
+/// Look up a primitive vector by label. Returns Some if the label
+/// matches a known primitive or derived concept.
+pub fn primitive_for(label: &str) -> Option<PrimitiveVector> {
+    match label {
+        "matter"   => Some(base_primitives::MATTER),
+        "motion"   => Some(base_primitives::MOTION),
+        "dimension" => Some(base_primitives::DIMENSION),
+        "time"     => Some(base_primitives::TIME),
+        "energy"   => Some(base_primitives::ENERGY),
+        "force"    => Some(base_primitives::FORCE),
+        "mass"     => Some(base_primitives::MASS),
+        "light"    => Some(base_primitives::LIGHT),
+        "sound"    => Some(base_primitives::SOUND),
+        "solid"    => Some(base_primitives::SOLID),
+        "liquid"   => Some(base_primitives::LIQUID),
+        "gas"      => Some(base_primitives::GAS),
+        "hot"      => Some(base_primitives::HOT),
+        "cold"     => Some(base_primitives::COLD),
+        "color"    => Some(base_primitives::COLOR),
+        "shape"    => Some(base_primitives::SHAPE),
+        "body"     => Some(base_primitives::BODY),
+        "surface"  => Some(base_primitives::SURFACE),
+        "edge"     => Some(base_primitives::EDGE),
+        "corner"   => Some(base_primitives::CORNER),
+        "up"       => Some(base_primitives::UP),
+        "down"     => Some(base_primitives::DOWN),
+        "big"      => Some(base_primitives::BIG),
+        "small"    => Some(base_primitives::SMALL),
+        "fast"     => Some(base_primitives::FAST),
+        "slow"     => Some(base_primitives::SLOW),
+        "momentum"  => Some(base_primitives::momentum()),
+        "temperature" => Some(base_primitives::temperature()),
+        "texture"   => Some(base_primitives::texture()),
+        _ => None,
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+//  FrameSchema — compositional semantic framing
+//
+//  A FrameSchema defines mandatory relational slots that a
+//  concept must fill to be "understood." For example,
+//  CommercialTransfer requires Buyer, Seller, Goods, Money.
+//
+//  Meaning is evaluated by how well input satisfies frame
+//  slot requirements.
+// ────────────────────────────────────────────────────────────
+
+/// Required role slot in a frame schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SlotBinding {
+    /// Slot name (e.g., "buyer", "seller", "goods")
+    pub name: String,
+    /// Expected NodeType for the filler
+    pub expected_type: NodeType,
+    /// Expected Relation linking the frame node to the filler
+    pub relation: Relation,
+    /// Whether this slot is mandatory or optional
+    pub required: bool,
+}
+
+/// A frame schema template — defines the structure of a concept
+/// in terms of its mandatory and optional relational slots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameSchema {
+    /// Schema name (e.g., "CommercialTransfer")
+    pub name: String,
+    /// The base CD action this schema represents
+    pub action: CDAction,
+    /// Required and optional slot definitions
+    pub slots: Vec<SlotBinding>,
+}
+
+/// An instantiated frame — a FrameSchema with bound slot fillers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FrameInstance {
+    /// The schema this instance was created from
+    pub schema_name: String,
+    /// The node this frame is attached to
+    pub frame_node: NodeId,
+    /// Bound slots: slot_name → node_id
+    pub bindings: Vec<(String, NodeId)>,
+    /// Satisfaction score (0.0 = none, 1.0 = complete)
+    pub satisfaction: f64,
+}
+
+impl FrameSchema {
+    pub fn new(name: &str, action: CDAction) -> Self {
+        FrameSchema { name: name.to_string(), action, slots: Vec::new() }
+    }
+
+    pub fn with_slot(mut self, name: &str, expected_type: NodeType, relation: Relation, required: bool) -> Self {
+        self.slots.push(SlotBinding {
+            name: name.to_string(),
+            expected_type,
+            relation,
+            required,
+        });
+        self
+    }
+
+    /// Evaluate how well a set of edges satisfies this schema.
+    /// Returns a satisfaction score [0.0, 1.0] and the set of
+    /// bound slots.
+    pub fn evaluate(&self, edges: &[Edge], graph: &GraphArena) -> (f64, Vec<(String, NodeId)>) {
+        let mut bindings: Vec<(String, NodeId)> = Vec::new();
+        let mut satisfied = 0usize;
+        let total = self.slots.len();
+
+        for slot in &self.slots {
+            // Find an edge matching this slot's relation
+            let mut found = false;
+            for edge in edges {
+                if edge.relation == slot.relation {
+                    // Check if the target node matches the expected type
+                    if let Some(node) = graph.get(edge.target) {
+                        let n = node.read();
+                        if n.node_type == slot.expected_type || slot.expected_type == NodeType::Entity {
+                            bindings.push((slot.name.clone(), edge.target));
+                            found = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            if found {
+                satisfied += 1;
+            }
+        }
+
+        let satisfaction = if total == 0 { 1.0 } else { satisfied as f64 / total as f64 };
+        (satisfaction, bindings)
+    }
+}
+
+/// Built-in frame schemas.
+pub mod frame_schemas {
+    use super::*;
+
+    pub fn commercial_transfer() -> FrameSchema {
+        FrameSchema::new("CommercialTransfer", CDAction::Atrans)
+            .with_slot("buyer", NodeType::Entity, Relation::Requires, true)
+            .with_slot("seller", NodeType::Entity, Relation::CausedBy, true)
+            .with_slot("goods", NodeType::Entity, Relation::HasProperty, true)
+            .with_slot("money", NodeType::Concept, Relation::AssociatedWith, true)
+    }
+
+    pub fn motion_event() -> FrameSchema {
+        FrameSchema::new("MotionEvent", CDAction::Ptrans)
+            .with_slot("actor", NodeType::Entity, Relation::Requires, true)
+            .with_slot("source", NodeType::Concept, Relation::CausedBy, false)
+            .with_slot("goal", NodeType::Concept, Relation::Implies, true)
+            .with_slot("instrument", NodeType::Concept, Relation::AssociatedWith, false)
+    }
+
+    pub fn sensory_event() -> FrameSchema {
+        FrameSchema::new("SensoryEvent", CDAction::Attend)
+            .with_slot("observer", NodeType::Entity, Relation::Requires, true)
+            .with_slot("stimulus", NodeType::Concept, Relation::HasProperty, true)
+            .with_slot("channel", NodeType::Sensor, Relation::GroundedIn, true)
+    }
+
+    pub fn ownership_change() -> FrameSchema {
+        FrameSchema::new("OwnershipChange", CDAction::Grasp)
+            .with_slot("owner", NodeType::Entity, Relation::Requires, true)
+            .with_slot("possession", NodeType::Entity, Relation::HasProperty, true)
+            .with_slot("previous_owner", NodeType::Entity, Relation::CausedBy, false)
+    }
+
+    /// Look up a schema by name.
+    pub fn by_name(name: &str) -> Option<FrameSchema> {
+        match name {
+            "CommercialTransfer" => Some(commercial_transfer()),
+            "MotionEvent" => Some(motion_event()),
+            "SensoryEvent" => Some(sensory_event()),
+            "OwnershipChange" => Some(ownership_change()),
+            _ => None,
+        }
+    }
+}
+
+// Direct re-exports for external crates that need specific types.
+pub use MotorCommandType;
+
+// ────────────────────────────────────────────────────────────
 //  Prelude
 // ────────────────────────────────────────────────────────────
 
@@ -946,9 +1290,12 @@ pub mod prelude {
         ActivationBuffer, GraphArena, SemanticContext,
         ConceptualFrame, ConceptualFrame as CD, CDType, CDAction,
         SemanticRelation,
+        PrimitiveVector, primitive_for, base_primitives,
+        FrameSchema, SlotBinding, FrameInstance, frame_schemas,
     };
     pub use super::{
         Neuromodulator, FiringHistory, PredictionError,
+        MotorCommandType,
         LTP_WINDOW, ELIGIBILITY_DECAY, LTP_RATE, DRIFT_RATE,
         PRUNE_THRESHOLD, PREDICTION_ERROR_THRESHOLD,
     };

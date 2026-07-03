@@ -1,5 +1,6 @@
 use crate::component::*;
 use semantic_graph::prelude::StructuralError;
+use semantic_graph::MotorCommandType;
 
 // ────────────────────────────────────────────────────────────
 //  Render AST — Compiled, validated intermediate representation
@@ -57,7 +58,24 @@ pub enum RenderAst {
         blend_mode: BlendMode,
         opacity: f32,
     },
+
+    /// Motor effector primitive — directly maps to a Grounding::MotorCommand.
+    ///
+    /// When this node fires in the spreading activation engine, it triggers
+    /// a render operation. The rendered output feeds back into the prediction
+    /// error system: a match between commanded and actual render state
+    /// generates a Reward spike; a mismatch generates PredictionError + Novelty.
+    Effector {
+        label: String,
+        command_type: MotorCommandType,
+        target: String,
+        parameters: Vec<f64>,
+        /// Expected visual result hash (prediction for feedback loop)
+        expected_hash: u64,
+    },
 }
+
+// MotorCommandType is re-exported from semantic_graph.
 
 /// Compile a decomposed prompt into a validated RenderAst tree.
 ///
@@ -168,6 +186,16 @@ pub fn validate_ast(ast: &RenderAst) -> Result<(), StructuralError> {
                                 target: semantic_graph::NodeId::ZERO,
                                 expected_input: semantic_graph::DataType::Any,
                                 actual_output: semantic_graph::DataType::Any,
+                            });
+                        }
+                    }
+                    RenderAst::Effector { label, target, .. } => {
+                        defined_labels.push(format!("effector:{}", label));
+                        // Effector target must reference an existing skeleton or composite
+                        if !defined_labels.iter().any(|d| d.contains(target)) {
+                            return Err(StructuralError::DeadNode {
+                                node_id: semantic_graph::NodeId::ZERO,
+                                label: format!("effector_target_not_found:{}", target),
                             });
                         }
                     }
@@ -284,6 +312,16 @@ fn ast_node_to_json(ast: &RenderAst) -> String {
                     BlendMode::Add => "add",
                 },
                 "opacity": opacity,
+            })).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into())
+        }
+        RenderAst::Effector { label, command_type, target, parameters, expected_hash } => {
+            serde_json::to_string_pretty(&serde_json::json!({
+                "type": "effector",
+                "label": label,
+                "command_type": command_type.label(),
+                "target": target,
+                "parameters": parameters,
+                "expected_hash": expected_hash,
             })).unwrap_or_else(|_| r#"{"error":"serialization_failed"}"#.into())
         }
     }
