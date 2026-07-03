@@ -112,6 +112,9 @@ pub struct CognitiveDaemon {
     /// Ticks since last consolidation pass
     consolidation_counter: std::sync::atomic::AtomicU64,
 
+    /// Optional visual effector buffer shared with the render bridge
+    effector_buffer: Option<Arc<VisualEffectorBuffer>>,
+
     /// Previous sensor readings for delta detection (arousal spike)
     prev_sensor_values: parking_lot::Mutex<Vec<(String, u8, f32)>>,
 
@@ -123,12 +126,13 @@ pub struct CognitiveDaemon {
 }
 
 impl CognitiveDaemon {
-    pub fn new(ctx: Arc<SemanticContext>) -> Self {
+    pub fn new(ctx: Arc<SemanticContext>, effector_buffer: Option<Arc<VisualEffectorBuffer>>) -> Self {
         let event_channel = Arc::new(EventChannel::new());
         let output_channel = Arc::new(RwLock::new(Vec::with_capacity(64)));
+        let eb = effector_buffer.clone();
 
         CognitiveDaemon {
-            engine: parking_lot::Mutex::new(ActivationEngine::new(ctx.clone())),
+            engine: parking_lot::Mutex::new(ActivationEngine::new(ctx.clone(), effector_buffer)),
             ctx,
             event_channel,
             output_channel,
@@ -136,6 +140,7 @@ impl CognitiveDaemon {
             paused: AtomicBool::new(false),
             tick_interval: Duration::from_millis(16),
             consolidation_counter: std::sync::atomic::AtomicU64::new(0),
+            effector_buffer: eb,
             prev_sensor_values: parking_lot::Mutex::new(Vec::with_capacity(8)),
             ticks_since_last_event: std::sync::atomic::AtomicU64::new(0),
             first_tick: std::sync::atomic::AtomicBool::new(true),

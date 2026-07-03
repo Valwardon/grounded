@@ -230,6 +230,60 @@ Compound prompts feed into the asset ingestor:
 
 ---
 
+## Visual Effector Pipeline
+
+The motor system bridges the cognitive daemon thread and the render thread through a lock-free double buffer:
+
+```
+Cognitive Daemon Thread (writer)           Render Bridge Thread (reader)
+┌──────────────────────────────┐           ┌──────────────────────────┐
+│  Phase 6 — Structural       │           │  wgpu/Null RenderBackend  │
+│  Verification + Effector    │           │                          │
+│  State Push                 │           │  loop {                  │
+│                              │           │    buffer.read(&state)  │
+│  compute_effector_state()   │  ┌──────┐ │    backend.render(state) │
+│    ↓                        │  │Lock  │ │    sleep(8ms)           │
+│  buffer.write(&state)       │──►Free  ◄──┤  }                      │
+│                              │  │Buf   │ │                          │
+│  VisualEffectorState:       │  └──────┘ │  AST Validation Errors   │
+│    [0..5]   rot0..5         │           │    → penalize_fn()       │
+│    [6..13]  color0/1 RGBA   │           └──────────────────────────┘
+│    [14..16] scale_xyz       │
+│    [17]     blend           │  Shared VisualEffectorBuffer
+│    [18..19] pal_coeff_0/1   │  (AtomicU64 × 11, double-buffered)
+│    [20]     bone_twist      │
+│    [21]     wireframe_flag  │
+└──────────────────────────────┘
+```
+
+### Sensor-to-Image Transforms
+
+Deterministic mapping from sensor readings to effector state:
+
+| Sensor | Transform | Effector Fields |
+|--------|-----------|-----------------|
+| Light (lux) | `PaletteInterpolator::compute(lux, arousal)` → log-normalized interpolation | pal_coeff_0, pal_coeff_1, wireframe_flag |
+| Accelerometer (gx, gy, gz) | `SkeletalTransformMatrix::from_gravity(g, activation)` → Euler angles | rot0..rot5 |
+| Gravity (magnitude) | `rest_pose_adjustment(g)` → scale (upright=1.0, supine=0.6) | scale_x/y/z |
+| Spatial activation | Color intensity = activation × 0.8 + 0.2 | color0_rgba, color1_rgba |
+
+- **`TransformEngine`** — one per daemon, owns `PaletteInterpolator` + previous gravity vector
+- **`light_to_palette_matrix()`** — pure function, side-effect-free palette interpolation
+- **`accel_to_skeletal_rotation()`** — pure function, maps accel vector to Euler rotation angles
+- **`gravitational_to_rest_pose()`** — pure function, maps gravity magnitude to scale modifiers
+
+### RenderBridge (own OS thread)
+
+Polls the lock-free `VisualEffectorBuffer` at 8ms intervals:
+
+- **`RenderBackend` trait** — abstract interface: `render(&state) → Result<u64, String>`
+- **`NullRenderBackend`** — computes a hash from state without actual rendering
+- **`WgpuRenderBackend`** — full wgpu state machine (requires `--features wgpu`), reads effector state → updates bone transforms, palette colors, wireframe toggle, encodes + submits passes
+- **`PenalizeFn`** — callback for `validate_ast()` error → `GraphArena::penalize_node()`
+- Started/stopped alongside `CognitiveDaemon` from `CognitiveLifecycle`
+
+---
+
 ## Three Structural Guardrails
 
 ### 1. Edge Invariants (compile-time / pre-execution)
@@ -295,9 +349,30 @@ After every tick's valence update:
 │  │  └──────────────────────────────────────────┘  │ │
 │  │                                                    │ │
 │  │  ┌──────────────────────────────────────────┐  │ │
-│  │  │ FrameSchmas + PrimitiveMatrix            │  │ │
-│  │  │ ├─ 5-dimensional vector algebra         │  │ │
-│  │  │ ├─ 28 base + 3 derived primitives        │  │ │
+│  │  │ VisualEffectorBuffer (lock-free)         │  │ │
+│  │  │ ├─ [AtomicU64; 11] × 2 double buffer    │  │ │
+│  │  │ ├─ Written by Phase 6 (cognitive thread)│  │ │
+│  │  │ └─ Read by RenderBridge (render thread)  │  │ │
+│  │  └──────────────────────────────────────────┘  │ │
+│  │                                                    │ │
+│  │  ┌──────────────────────────────────────────┐  │ │
+│  │  │ RenderBridge Thread (8ms poll)           │  │ │
+│  │  │ ├─ Polls VisualEffectorBuffer            │  │ │
+│  │  │ ├─ RenderBackend trait (wgpu/Null)       │  │ │
+│  │  │ └─ validate_ast() error → penalize node  │  │ │
+│  │  └──────────────────────────────────────────┘  │ │
+│  │                                                    │ │
+│  │  ┌──────────────────────────────────────────┐  │ │
+│  │  │ Sensor→Image Transforms (asset-ingestor) │  │ │
+│  │  │ ├─ PaletteInterpolator (lux→palette)     │  │ │
+│  │  │ ├─ SkeletalTransformMatrix (accel→rot)   │  │ │
+│  │  │ └─ TransformEngine (sensor→effector)     │  │ │
+│  │  └──────────────────────────────────────────┘  │ │
+│  │                                                    │ │
+│  │  ┌──────────────────────────────────────────┐  │ │
+│  │  │ FrameSchemas + PrimitiveMatrix           │  │ │
+│  │  │ ├─ 5-dimensional vector algebra          │  │ │
+│  │  │ ├─ 31 base + derived primitives          │  │ │
 │  │  │ ├─ 4 built-in frame schemas              │  │ │
 │  │  │ └─ Frame satisfaction evaluation         │  │ │
 │  │  └──────────────────────────────────────────┘  │ │
@@ -309,12 +384,12 @@ After every tick's valence update:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode (valence), GraphArena, ActivationBuffer, Edge (STDP, contract), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 10 Relation types, MotorCommandType (effector commands) |
+| `semantic-graph` | GroundedNode (valence), GraphArena, ActivationBuffer, Edge (STDP, contract), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 10 Relation types, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer, **CCG RelationalParser** (shift-reduce, semantic categories, 7 reduction rules, proximity fallback) |
-| `cognitive-core` | ActivationEngine (6-phase tick), VerificationLoop, CognitiveDaemon, **RenderCommand/RenderPrediction feedback loop**, EventChannel, Consolidation |
-| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge |
+| `cognitive-core` | ActivationEngine (6-phase tick), VerificationLoop, CognitiveDaemon, **RenderCommand/RenderPrediction feedback loop**, Phase 6 VisualEffectorBuffer push, EventChannel, Consolidation |
+| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge, **RenderBridge** (OS thread, buffer polling, RenderBackend trait, Null/Wgpu backends) |
 | `curiosity-core` | Gap detection, **CCG-based DefinitionResolver**, async harvester, **CuriosityBudget** (energy-aware, replaces depth 10) |
-| `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json |
+| `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json, **effector math** (GravityVector, PaletteInterpolator, SkeletalTransformMatrix), **TransformEngine** (sensor→effector) |
 | `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
 ## Status
@@ -336,6 +411,11 @@ After every tick's valence update:
 - [x] **CuriosityBudget**: energy-aware search, replaces depth-10 circuit breaker
 - [x] **ConceptualFrame slots**: FrameSchema/SlotBinding/FrameInstance, 4 built-in schemas, satisfaction evaluation
 - [x] **Unified cognitive-render loop**: MotorCommand grounding, Effector AST nodes, RenderCommand->prediction->feedback->reward/novelty
+- [x] **VisualEffectorBuffer**: lock-free `[AtomicU64; 11]` × 2 double buffer in semantic-graph
+- [x] **Effector math**: GravityVector, PaletteInterpolator, SkeletalTransformMatrix, 3 new derived primitives (kinetic_energy, spatial_bound, color_intensity)
+- [x] **TransformEngine**: deterministic light→palette, accel→skeletal rotation, gravitational→rest-pose in asset-ingestor
+- [x] **RenderBridge**: OS thread polling VisualEffectorBuffer at 8ms, RenderBackend trait (Null/Wgpu), validate_ast() error → penalize callback in hw-daemon
+- [x] **Phase 6 effector push**: ActivationEngine.compute_effector_state() → VisualEffectorBuffer.write() after structural verification
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
 

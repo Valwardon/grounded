@@ -2,7 +2,7 @@
 name = "hw-daemon"
 version = "0.1.0"
 edition = "2024"
-description = "Android ForegroundService bridge — lock-free channels, sensor ingestion, lifecycle"
+description = "Android ForegroundService bridge — lock-free channels, sensor ingestion, lifecycle, render bridge"
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
@@ -10,6 +10,11 @@ serde_json = { workspace = true }
 parking_lot = { workspace = true }
 cognitive-core = { path = "../cognitive-core" }
 semantic-graph = { path = "../semantic-graph" }
+wgpu = { version = "22", optional = true }
 
 [target.'cfg(target_os = "android")'.dependencies]
 jni = "0.21"
+
+[features]
+default = []
+wgpu = ["dep:wgpu"]

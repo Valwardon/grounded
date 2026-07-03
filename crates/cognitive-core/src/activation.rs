@@ -90,13 +90,17 @@ pub struct ActivationEngine {
     /// Render predictions awaiting feedback (used for prediction error checks).
     pub render_predictions: Vec<RenderPrediction>,
 
+    // ── Visual effector buffer (lock-free, shared with render bridge) ──
+    /// Optional lock-free buffer for pushing effector commands to the render bridge.
+    pub effector_buffer: Option<Arc<VisualEffectorBuffer>>,
+
     // ── Staging arrays (pre-allocated, zero alloc in hot path) ──
     /// Which nodes fired this tick (bitset, parallel to firing_history words)
     fired_this_tick: Vec<u64>,
 }
 
 impl ActivationEngine {
-    pub fn new(ctx: Arc<SemanticContext>) -> Self {
+    pub fn new(ctx: Arc<SemanticContext>, effector_buffer: Option<Arc<VisualEffectorBuffer>>) -> Self {
         let len = ctx.graph.read().len().max(64);
         let words = (len + 63) / 64;
         ActivationEngine {
@@ -109,6 +113,7 @@ impl ActivationEngine {
             structural_faults: Vec::with_capacity(2),
             pending_render_commands: Vec::with_capacity(8),
             render_predictions: Vec::with_capacity(8),
+            effector_buffer,
             fired_this_tick: vec![0; words.max(1)],
             ctx,
         }
@@ -448,6 +453,12 @@ impl ActivationEngine {
             }
         }
 
+        // ── Push effector state to VisualEffectorBuffer (lock-free) ──
+        if let Some(ref buffer) = self.effector_buffer {
+            let state = self.compute_effector_state(&self.fired);
+            buffer.write(&state);
+        }
+
         // ── Advance firing history ring buffer ──
         self.firing_history.advance_tick();
 
@@ -460,6 +471,87 @@ impl ActivationEngine {
         act_guard.flip();
 
         &self.fired
+    }
+
+    // ── Effector state computation ──────────────────────
+
+    /// Compute a [f32; 22] effector state from the fired action list.
+    ///
+    /// Iterates fired nodes with MotorCommand grounding and accumulates
+    /// activation-weighted transform parameters into the 22-element
+    /// state array. Kinetic/spatial activation is derived from
+    /// MotorCommand type frequency: DrawSkeleton fires boost kinetic,
+    /// ApplyMesh fires boost spatial.
+    ///
+    /// Lock-free: called from the cognitive tick hot path
+    /// and written atomically into VisualEffectorBuffer.
+    fn compute_effector_state(&self, fired: &[FiredAction]) -> [f32; EFFECTOR_STATE_FLOATS] {
+        let mut state = [0.0f32; EFFECTOR_STATE_FLOATS];
+        let mut kinetic_total: f32 = 0.0;
+        let mut spatial_total: f32 = 0.0;
+        let mut motor_count: usize = 0;
+
+        for action in fired {
+            if let Grounding::MotorCommand { command_type, ref parameters, .. } = &action.grounding {
+                let act = action.activation_level as f32;
+                motor_count += 1;
+                match command_type {
+                    MotorCommandType::ApplyTransform => {
+                        // Accumulate rotation angles from transform parameters (radians)
+                        for (j, p) in parameters.iter().enumerate().take(6) {
+                            state[j] = state[j] + act * (*p as f32);
+                        }
+                        kinetic_total += act * 0.6;
+                    }
+                    MotorCommandType::DrawSkeleton => {
+                        // Accumulate scale from parameters
+                        if parameters.len() >= 3 {
+                            state[14] += act * parameters[0] as f32;
+                            state[15] += act * parameters[1] as f32;
+                            state[16] += act * parameters[2] as f32;
+                        }
+                        state[20] += act; // bone_twist modifier
+                        kinetic_total += act * 0.8;
+                    }
+                    MotorCommandType::ApplyMesh => {
+                        // Color intensity from mesh parameters
+                        if let Some(c) = parameters.first() {
+                            state[6] += act * (*c as f32); // color_r0
+                            state[10] += act * (*c as f32 * 0.5); // color_r1
+                        }
+                        spatial_total += act * 0.7;
+                    }
+                    MotorCommandType::Composite => {
+                        // Blend weight from composite commands
+                        state[17] += act * 0.3;
+                        spatial_total += act * 0.3;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Clamp all values to prevent unbounded accumulation
+        for val in state.iter_mut() {
+            *val = val.clamp(-10.0, 10.0);
+        }
+
+        // Derive color palette from kinetic/spatial totals
+        let kinetic_blend = if motor_count > 0 {
+            (kinetic_total / motor_count as f32 * 0.8 + 0.2).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        let spatial_blend = if motor_count > 0 {
+            (spatial_total / motor_count as f32 * 0.8 + 0.2).clamp(0.0, 1.0)
+        } else {
+            0.5
+        };
+        effector_state::set_color0(&mut state, kinetic_blend, spatial_blend * 0.5, 0.3, 1.0);
+        effector_state::set_color1(&mut state, 0.3, 0.5, spatial_blend, kinetic_blend);
+        effector_state::set_palette_coeffs(&mut state, kinetic_blend, spatial_blend);
+
+        state
     }
 
     // ── Bitset helpers ──────────────────────────────────

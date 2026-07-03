@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use cognitive_core::CognitiveDaemon;
 use semantic_graph::prelude::*;
+use crate::render_bridge::{RenderBridge, NullRenderBackend};
 
 // ────────────────────────────────────────────────────────────
 //  Foreground Service Lifecycle Manager
@@ -22,6 +23,7 @@ pub struct CognitiveLifecycle {
     daemon: Option<Arc<CognitiveDaemon>>,
     ctx: Option<Arc<SemanticContext>>,
     graph_path: Option<String>,
+    render_bridge: Option<parking_lot::Mutex<RenderBridge>>,
     running: AtomicBool,
     /// Last tick timestamp (ms since epoch) — for keepalive heartbeat
     last_tick_ms: AtomicU64,
@@ -35,6 +37,7 @@ impl CognitiveLifecycle {
             daemon: None,
             ctx: None,
             graph_path: None,
+            render_bridge: None,
             running: AtomicBool::new(false),
             last_tick_ms: AtomicU64::new(0),
             missed_heartbeats: AtomicU64::new(0),
@@ -43,6 +46,7 @@ impl CognitiveLifecycle {
 
     /// Called once from Kotlin ForegroundService.onCreate().
     /// Initializes the graph, optionally restoring from disk.
+    /// Creates the RenderBridge + shared VisualEffectorBuffer.
     pub fn on_create(&mut self, data_dir: &str) {
         let graph_path = format!("{}/semantic_graph.bin", data_dir);
         self.graph_path = Some(graph_path.clone());
@@ -55,24 +59,37 @@ impl CognitiveLifecycle {
 
         let ctx = SemanticContext::new(graph);
         self.ctx = Some(ctx.clone());
-        self.daemon = Some(Arc::new(CognitiveDaemon::new(ctx)));
+
+        // Create render bridge with shared effector buffer
+        let (mut bridge, effector_buffer) = RenderBridge::new();
+        bridge.set_backend(Box::new(NullRenderBackend));
+        self.render_bridge = Some(parking_lot::Mutex::new(bridge));
+
+        // Pass the shared buffer to CognitiveDaemon
+        self.daemon = Some(Arc::new(CognitiveDaemon::new(ctx, Some(effector_buffer))));
     }
 
-    /// Start the cognitive background loop.
+    /// Start the cognitive background loop + render bridge.
     /// Maps to Kotlin's onStartCommand() with START_STICKY.
     pub fn start(&self) {
         if let Some(ref daemon) = self.daemon {
             daemon.start();
             self.running.store(true, Ordering::Release);
         }
+        if let Some(ref bridge) = self.render_bridge {
+            bridge.lock().start();
+        }
     }
 
-    /// Stop the cognitive loop and persist graph state.
+    /// Stop the cognitive loop + render bridge and persist graph state.
     /// Maps to Kotlin's onDestroy().
     pub fn stop(&self) {
         if let Some(ref daemon) = self.daemon {
             daemon.stop();
             self.running.store(false, Ordering::Release);
+        }
+        if let Some(ref bridge) = self.render_bridge {
+            bridge.lock().stop();
         }
         self.persist_graph();
     }

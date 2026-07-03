@@ -1094,6 +1094,18 @@ pub mod base_primitives {
     pub fn momentum() -> PrimitiveVector { MOTION.combine(&MASS) }
     pub fn temperature() -> PrimitiveVector { HOT.combine(&COLD) }
     pub fn texture() -> PrimitiveVector { SURFACE.combine(&MASS) }
+
+    /// KineticEnergy = Motion + Mass — drives skeletal rotation scaling.
+    /// Activation from accelerometer deltas → modulates rot0..rot5.
+    pub fn kinetic_energy() -> PrimitiveVector { MOTION.combine(&MASS) }
+
+    /// SpatialBound = Dimension + Matter — drives color intensity.
+    /// Activation from proximity sensor → modulates RGB channels.
+    pub fn spatial_bound() -> PrimitiveVector { DIMENSION.combine(&MATTER) }
+
+    /// ColorIntensity = Light + Color — drives palette interpolation.
+    /// Activation from light sensor → modulates palette coefficients.
+    pub fn color_intensity() -> PrimitiveVector { LIGHT.combine(&COLOR) }
 }
 
 /// Look up a primitive vector by label. Returns Some if the label
@@ -1129,7 +1141,161 @@ pub fn primitive_for(label: &str) -> Option<PrimitiveVector> {
         "momentum"  => Some(base_primitives::momentum()),
         "temperature" => Some(base_primitives::temperature()),
         "texture"   => Some(base_primitives::texture()),
+        "kinetic_energy" => Some(base_primitives::kinetic_energy()),
+        "spatial_bound" => Some(base_primitives::spatial_bound()),
+        "color_intensity" => Some(base_primitives::color_intensity()),
         _ => None,
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+//  VisualEffectorState — packed lock-free render state
+//
+//  A 22-element [f32] array stored as 11 AtomicU64 words (2 f32 per word).
+//  Layout:
+//    [0..5]   rot0..rot5        — skeletal rotation angles (radians)
+//    [6..9]   color0_r/g/b/a    — first palette color (RGBA)
+//    [10..13] color1_r/g/b/a    — second palette color (RGBA)
+//    [14..16] scale_x/y/z       — skeletal scale factors
+//    [17]     blend             — blend weight [0,1]
+//    [18..19] pal_coeff_0/1     — palette interpolation coefficients
+//    [20]     bone_twist        — bone twist angle modifier
+//    [21]     wireframe_flag    — 0.0 = normal, 1.0 = wireframe
+// ────────────────────────────────────────────────────────────
+
+/// Number of f32 values in a VisualEffectorState.
+pub const EFFECTOR_STATE_FLOATS: usize = 22;
+/// Number of AtomicU64 words (2 f32 per word).
+pub const EFFECTOR_STATE_WORDS: usize = 11;
+
+/// Lock-free visual effector state — 22 f32 values packed as 11 AtomicU64.
+///
+/// Access is entirely lock-free: readers sample the readable generation,
+/// read both AtomicU64 buffers, then verify no torn read by checking
+/// the generation again. Writers write to the back buffer and flip.
+#[derive(Debug)]
+pub struct VisualEffectorBuffer {
+    buffer_a: [AtomicU64; EFFECTOR_STATE_WORDS],
+    buffer_b: [AtomicU64; EFFECTOR_STATE_WORDS],
+    /// Which buffer is currently readable (0 = a, 1 = b).
+    readable: AtomicU8,
+}
+
+unsafe impl Send for VisualEffectorBuffer {}
+unsafe impl Sync for VisualEffectorBuffer {}
+
+impl VisualEffectorBuffer {
+    /// Create a new zero-initialized buffer.
+    pub fn new() -> Self {
+        VisualEffectorBuffer {
+            buffer_a: Default::default(),
+            buffer_b: Default::default(),
+            readable: AtomicU8::new(0),
+        }
+    }
+
+    /// Write a full effector state into the write buffer and atomically
+    /// flip the readable generation. Called from the cognitive engine thread.
+    #[inline]
+    pub fn write(&self, state: &[f32; EFFECTOR_STATE_FLOATS]) {
+        let write_idx = 1 - self.readable.load(Ordering::Relaxed);
+        let buffer = if write_idx == 0 { &self.buffer_a } else { &self.buffer_b };
+        for i in 0..EFFECTOR_STATE_WORDS {
+            let lo = state[i * 2].to_bits() as u64;
+            let hi = (state[i * 2 + 1].to_bits() as u64) << 32;
+            buffer[i].store(lo | hi, Ordering::Relaxed);
+        }
+        // Ensure all buffer writes are visible before readable flip
+        std::sync::atomic::fence(Ordering::Release);
+        self.readable.store(write_idx, Ordering::Release);
+    }
+
+    /// Read the latest committed effector state. Returns `false` if
+    /// a torn read was detected (reader should retry).
+    #[inline]
+    pub fn read(&self, out: &mut [f32; EFFECTOR_STATE_FLOATS]) -> bool {
+        let idx = self.readable.load(Ordering::Acquire);
+        std::sync::atomic::fence(Ordering::Acquire);
+        let buffer = if idx == 0 { &self.buffer_a } else { &self.buffer_b };
+        for i in 0..EFFECTOR_STATE_WORDS {
+            let word = buffer[i].load(Ordering::Relaxed);
+            let lo = word as u32;
+            let hi = (word >> 32) as u32;
+            out[i * 2] = f32::from_bits(lo);
+            out[i * 2 + 1] = f32::from_bits(hi);
+        }
+        // Verify no torn read: generation must match
+        self.readable.load(Ordering::Acquire) == idx
+    }
+}
+
+impl Default for VisualEffectorBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Pack/unpack helpers for operating on [f32; 22] render state arrays.
+pub mod effector_state {
+    use super::*;
+
+    /// Set a skeletal rotation angle (radians).
+    #[inline]
+    pub fn set_rotation(state: &mut [f32; EFFECTOR_STATE_FLOATS], joint: usize, radians: f32) {
+        if joint < 6 {
+            state[joint] = radians;
+        }
+    }
+
+    /// Set palette color 0 (RGBA).
+    #[inline]
+    pub fn set_color0(state: &mut [f32; EFFECTOR_STATE_FLOATS], r: f32, g: f32, b: f32, a: f32) {
+        state[6] = r;
+        state[7] = g;
+        state[8] = b;
+        state[9] = a;
+    }
+
+    /// Set palette color 1 (RGBA).
+    #[inline]
+    pub fn set_color1(state: &mut [f32; EFFECTOR_STATE_FLOATS], r: f32, g: f32, b: f32, a: f32) {
+        state[10] = r;
+        state[11] = g;
+        state[12] = b;
+        state[13] = a;
+    }
+
+    /// Set skeletal scale.
+    #[inline]
+    pub fn set_scale(state: &mut [f32; EFFECTOR_STATE_FLOATS], x: f32, y: f32, z: f32) {
+        state[14] = x;
+        state[15] = y;
+        state[16] = z;
+    }
+
+    /// Set blend weight [0,1].
+    #[inline]
+    pub fn set_blend(state: &mut [f32; EFFECTOR_STATE_FLOATS], blend: f32) {
+        state[17] = blend;
+    }
+
+    /// Set palette interpolation coefficients.
+    #[inline]
+    pub fn set_palette_coeffs(state: &mut [f32; EFFECTOR_STATE_FLOATS], c0: f32, c1: f32) {
+        state[18] = c0;
+        state[19] = c1;
+    }
+
+    /// Set bone twist angle modifier.
+    #[inline]
+    pub fn set_bone_twist(state: &mut [f32; EFFECTOR_STATE_FLOATS], twist: f32) {
+        state[20] = twist;
+    }
+
+    /// Set wireframe flag (0.0 = normal, 1.0 = wireframe).
+    #[inline]
+    pub fn set_wireframe(state: &mut [f32; EFFECTOR_STATE_FLOATS], wf: f32) {
+        state[21] = wf;
     }
 }
 
@@ -1279,6 +1445,7 @@ pub mod frame_schemas {
 
 // Direct re-exports for external crates that need specific types.
 pub use MotorCommandType;
+pub use VisualEffectorBuffer;
 
 // ────────────────────────────────────────────────────────────
 //  Prelude
@@ -1301,5 +1468,9 @@ pub mod prelude {
     };
     pub use super::{
         InvariantContract, DataType, StructuralError,
+    };
+    pub use super::{
+        VisualEffectorBuffer, effector_state,
+        EFFECTOR_STATE_FLOATS, EFFECTOR_STATE_WORDS,
     };
 }

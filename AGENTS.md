@@ -233,6 +233,90 @@ Phase 6 — Structural Verification (O(N+E)):
 - **Parsing is shift-reduce CCG** — stateless, deterministic, no regex. 6 ad-hoc grammar patterns replaced by 7 combinatory reduction rules. Unrecognized structures degrade to AssociatedWith proximity.
 - **CuriosityBudget replaces recursion_depth** — `KnowledgeGap.budget: CuriosityBudget` instead of `recursion_depth: u8`. Budget is carried through recursive resolution chain.
 
+## Visual Effector Pipeline (Cross-Crate Integration)
+
+```
+Cognitive Daemon Thread (writer)           Render Bridge Thread (reader)
+┌──────────────────────────────┐           ┌──────────────────────────┐
+│  Phase 6 — Structural       │           │  wgpu/Null RenderBackend  │
+│  Verification + Effector    │           │                          │
+│  State Push                 │           │  loop {                  │
+│                              │           │    buffer.read(&state)  │
+│  compute_effector_state()   │  ┌──────┐ │    backend.render(state) │
+│    ↓                        │  │Lock  │ │    sleep(8ms)           │
+│  buffer.write(&state)       │──►Free  ◄──┤  }                      │
+│                              │  │Buf   │ │                          │
+│  VisualEffectorState:       │  └──────┘ │  AST Validation Errors   │
+│    [0..5]   rot0..5         │           │    → penalize_fn()       │
+│    [6..13]  color0/1 RGBA   │           └──────────────────────────┘
+│    [14..16] scale_xyz       │
+│    [17]     blend           │  Shared VisualEffectorBuffer
+│    [18..19] pal_coeff_0/1   │  (AtomicU64 × 11, double-buffered)
+│    [20]     bone_twist      │
+│    [21]     wireframe_flag  │
+└──────────────────────────────┘
+```
+
+### VisualEffectorBuffer (semantic-graph)
+
+Lock-free double-buffered state array (no mutex, no RwLock in hot path):
+
+- **22 f32 values** packed as 11 AtomicU64 words (2 f32 per word)
+- **Double-buffered**: writer writes to back buffer then atomically flips readable generation (AtomicU8)
+- **Reader** polls generation, reads both buffers, verifies generation unchanged (torn-read detection)
+- **Writer** (cognitive daemon, Phase 6) calls `buffer.write(&state)` — zero allocation
+- **Reader** (render bridge thread) calls `buffer.read(&mut state)` — returns false on torn read
+- Stored as `Arc<VisualEffectorBuffer>` shared between CognitiveDaemon and RenderBridge
+
+### Sensor-to-Image Transforms (asset-ingestor)
+
+Deterministic sensor → effector state mapping, no random numbers:
+
+| Sensor | Transform | Effector Fields |
+|--------|-----------|-----------------|
+| Light (lux) | `PaletteInterpolator::compute(lux, arousal)` → log-normalized interpolation | pal_coeff_0, pal_coeff_1, wireframe_flag |
+| Accelerometer (gx, gy, gz) | `SkeletalTransformMatrix::from_gravity(g, activation)` → Euler angles | rot0..rot5 |
+| Gravity (magnitude) | `rest_pose_adjustment(g)` → scale (upright=1.0, supine=0.6) | scale_x/y/z |
+| Spatial activation | Color intensity = activation * 0.8 + 0.2 | color0_rgba, color1_rgba |
+
+- **`TransformEngine`** — one per cognitive daemon, owns `PaletteInterpolator` + previous gravity
+- **`light_to_palette_matrix()`** — pure function, side-effect-free palette interpolation
+- **`accel_to_skeletal_rotation()`** — pure function, maps accel vector to Euler rotation angles
+- **`gravitational_to_rest_pose()`** — pure function, maps gravity magnitude to scale modifiers
+
+### RenderBridge (hw-daemon)
+
+Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
+
+- **`RenderBackend` trait** — abstract wgpu/no-op backend, `render(&state) → Result<u64, String>`
+- **`NullRenderBackend`** — computes hash from state, no actual rendering
+- **`WgpuRenderBackend`** — full wgpu state machine (requires `--features wgpu`), reads effector state → updates skeletal bone transforms, palette colors, wireframe toggle, encodes + submits render pass
+- **`PenalizeFn`** — callback for validate_ast() error → GraphArena penalization
+- **8ms poll interval** (≈120Hz), sleeps between polls, no busy-wait
+- Started/stopped alongside CognitiveDaemon from CognitiveLifecycle
+
+## Crate Map (Updated)
+
+### semantic-graph additions
+- `VisualEffectorBuffer` — lock-free `[AtomicU64; 11]` double-buffered state
+- `effector_state` module — helpers for packing/unpacking the 22-element state array
+- `EFFECTOR_STATE_FLOATS` (22), `EFFECTOR_STATE_WORDS` (11) — layout constants
+- `base_primitives::kinetic_energy()` — Motion × Mass, drives rotation scaling
+- `base_primitives::spatial_bound()` — Dimension × Matter, drives color intensity
+- `base_primitives::color_intensity()` — Light × Color, drives palette interpolation
+
+### asset-ingestor additions
+- `effector.rs` — `GravityVector`, `PaletteInterpolator`, `SkeletalTransformMatrix` (4×4 rotation, gravity decomposition, rest-pose adjustment)
+- `sensor_transform.rs` — `TransformEngine` (light→palette, accel→skeletal, gravitational→rest-pose), `light_to_palette_matrix()`, `accel_to_skeletal_rotation()`, `gravitational_to_rest_pose()` pure functions
+
+### hw-daemon additions
+- `render_bridge.rs` — `RenderBridge` (own thread, buffer polling, backend abstraction), `RenderBackend` trait, `NullRenderBackend`, `WgpuRenderBackend` (feature-gated `wgpu`), `PenalizeFn` callback
+
+### cognitive-core additions
+- `ActivationEngine::effector_buffer: Option<Arc<VisualEffectorBuffer>>` — written to during Phase 6
+- `ActivationEngine::compute_effector_state()` — aggregates fired MotorCommand nodes into 22-element state array
+- `CognitiveDaemon::new(ctx, effector_buffer)` — accepts shared buffer, passes to ActivationEngine
+
 ## Critical Rules for Agent
 
 1. NEVER add randomness, probability, or ML. Every decision is deterministic graph math, CCG reduction, or table lookup.
