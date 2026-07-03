@@ -134,6 +134,13 @@ pub struct GroundedNode {
     pub threshold: f64,
     pub base_activation: f64,
     pub edges: Vec<Edge>,
+
+    /// Valence: running average of positive/negative experience associated with this node.
+    /// -1.0 (aversive) to +1.0 (attractive). Updated each tick based on co-occurrence
+    /// with prediction errors (negative) or reward (positive).
+    /// Drives preference formation — the system forms "likes" and "dislikes"
+    /// deterministically from its own prediction history.
+    pub valence: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -218,6 +225,7 @@ impl GraphArena {
             threshold: f64::MAX,
             base_activation: 0.0,
             edges: Vec::new(),
+            valence: 0.0,
         }));
         // Index 1: the persistent self — every experience anchors here
         arena.nodes.push(parking_lot::RwLock::new(GroundedNode {
@@ -229,6 +237,7 @@ impl GraphArena {
             threshold: f64::MAX,
             base_activation: 1.0,
             edges: Vec::new(),
+            valence: 0.5,
         }));
         arena.label_index.push(("self".to_string(), NodeId::SELF));
         arena
@@ -300,6 +309,52 @@ impl GraphArena {
             let node = self.nodes[idx].read();
             Some((edge.target, node.label.clone(), edge.relation))
         }).collect()
+    }
+
+    /// Get the valence of a node.
+    pub fn get_valence(&self, id: NodeId) -> Option<f64> {
+        self.nodes.get(id.0 as usize).map(|n| n.read().valence)
+    }
+
+    /// Set the valence of a node.
+    pub fn set_valence(&self, id: NodeId, v: f64) {
+        if let Some(n) = self.nodes.get(id.0 as usize) {
+            n.write().valence = v.clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Update valence toward a target (running average).
+    /// valence += (target - valence) * rate
+    pub fn update_valence(&self, id: NodeId, target: f64, rate: f64) {
+        if let Some(n) = self.nodes.get(id.0 as usize) {
+            let mut node = n.write();
+            node.valence = (node.valence + (target - node.valence) * rate).clamp(-1.0, 1.0);
+        }
+    }
+
+    /// Return up to `count` node IDs with the highest valence.
+    /// Excludes NodeId::ZERO and optionally NodeId::SELF.
+    pub fn nodes_with_highest_valence(&self, count: usize, include_self: bool) -> Vec<(NodeId, f64)> {
+        let mut scored: Vec<(NodeId, f64)> = self.nodes.iter().enumerate()
+            .filter(|(i, _)| *i > 0 && (include_self || *i as u64 != NodeId::SELF.0))
+            .filter_map(|(i, n)| {
+                let node = n.read();
+                if node.valence.abs() > 0.01 { Some((NodeId::from_raw(i as u64), node.valence)) } else { None }
+            })
+            .collect();
+        scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        scored.truncate(count);
+        scored
+    }
+
+    /// Find a node by label (exact match).
+    pub fn find_by_label(&self, label: &str) -> Option<NodeId> {
+        self.label_index.iter().find(|(l, _)| l == label).map(|(_, id)| *id)
+    }
+
+    /// Get label for a node ID.
+    pub fn label_of(&self, id: NodeId) -> Option<String> {
+        self.nodes.get(id.0 as usize).map(|n| n.read().label.clone())
     }
 
     /// Remove edges whose dynamic weight has been pruned.

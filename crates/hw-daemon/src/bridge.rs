@@ -137,6 +137,36 @@ pub fn read_modulators() -> String {
     "{}".to_string()
 }
 
+/// Get the system's opinion about a topic.
+pub fn get_opinion(topic: &str) -> String {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        lc.get_opinion(topic)
+    } else {
+        format!("I don't know what '{}' is.", topic)
+    }
+}
+
+/// Return the system's current interests (top-N high-valence concepts).
+pub fn get_interests(count: usize) -> Vec<String> {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        lc.get_interests(count)
+    } else {
+        Vec::new()
+    }
+}
+
+/// Get a short description of the system's current mood.
+pub fn get_mood() -> String {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        lc.get_mood()
+    } else {
+        "Not running.".to_string()
+    }
+}
+
 /// Called on memory pressure to persist graph state.
 pub fn trim_memory() {
     let guard = lifecycle().read();

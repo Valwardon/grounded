@@ -302,6 +302,52 @@ impl ActivationEngine {
             }
         }
 
+        // ──────────────────────────────────────────────────
+        //  Phase 5 — Valence update (preference formation)
+        // ──────────────────────────────────────────────────
+        //
+        //  Nodes that fire without prediction error → positive valence (familiar = good).
+        //  Nodes involved in prediction errors → negative valence (surprise = aversive).
+        //  SELF drifts slowly upward (baseline contentment).
+        //  Over time, this creates genuine preferences — the system "likes" what it
+        //  can predict and "dislikes" what surprises it.
+
+        let reward_level = self.modulators.reward;
+
+        // Build set of node IDs with prediction errors this tick
+        let mut error_nodes: Vec<usize> = self.prediction_errors.iter()
+            .map(|e| e.node_id.0 as usize)
+            .collect();
+        error_nodes.sort();
+        error_nodes.dedup();
+
+        for action in &self.fired {
+            let idx = action.node_id.0 as usize;
+            let in_error = error_nodes.binary_search(&idx).is_ok();
+            if in_error {
+                // Negative: surprise is aversive
+                graph.update_valence(action.node_id, -0.3, 0.05);
+            } else {
+                // Positive: familiar patterns feel good
+                let pos_target = 0.2 + reward_level * 0.3;
+                graph.update_valence(action.node_id, pos_target, 0.02);
+            }
+        }
+
+        // Nodes that received injection but didn't fire: mild positive (being noticed)
+        for i in 1..node_count {
+            if self.injection_queue[i] > 0.0 {
+                let id = NodeId::from_raw(i as u64);
+                let already_fired = self.fired.iter().any(|f| f.node_id == id);
+                if !already_fired {
+                    graph.update_valence(id, 0.1, 0.01);
+                }
+            }
+        }
+
+        // SELF baseline: slow drift toward positive
+        graph.update_valence(NodeId::SELF, 0.5, 0.001);
+
         // ── Advance firing history ring buffer ──
         self.firing_history.advance_tick();
 
@@ -374,6 +420,7 @@ mod tests {
             threshold: 2.0,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(2))],
+            valence: 0.0,
         });
 
         g.insert(GroundedNode {
@@ -385,6 +432,7 @@ mod tests {
             threshold: 1.5,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
+            valence: 0.0,
         });
 
         g.insert(GroundedNode {
@@ -398,6 +446,7 @@ mod tests {
             threshold: 1.0,
             base_activation: 0.0,
             edges: Vec::new(),
+            valence: 0.0,
         });
 
         g
@@ -467,6 +516,7 @@ mod tests {
             threshold: 0.5,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(3))],
+            valence: 0.0,
         };
         let n3 = GroundedNode {
             id: NodeId::ZERO,
@@ -477,8 +527,8 @@ mod tests {
             threshold: 1.5,
             base_activation: 0.0,
             edges: Vec::new(),
+            valence: 0.0,
         };
-        graph.insert(n2);
         graph.insert(n3);
 
         let ctx = SemanticContext::new(graph);
@@ -538,6 +588,7 @@ mod tests {
             threshold: 5.0,  // high threshold
             base_activation: 0.0,
             edges: Vec::new(),
+            valence: 0.0,
         };
         graph.insert(node);
         let ctx = SemanticContext::new(graph);

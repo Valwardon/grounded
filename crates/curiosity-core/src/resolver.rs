@@ -70,6 +70,7 @@ impl DefinitionResolver {
                     threshold: 10.0,
                     base_activation: 0.0,
                     edges: Vec::with_capacity(predicates.len()),
+                    valence: 0.0,
                 });
                 id
             }
@@ -105,6 +106,7 @@ impl DefinitionResolver {
                         threshold: 10.0,
                         base_activation: 0.0,
                         edges: Vec::new(),
+                        valence: 0.0,
                     });
                     if !dependencies.contains(&pred.object.to_lowercase()) {
                         dependencies.push(pred.object.to_lowercase());

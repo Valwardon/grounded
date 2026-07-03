@@ -128,6 +128,30 @@ impl CognitiveLifecycle {
             .unwrap_or((0.0, 0.0, 0.0))
     }
 
+    /// Generate an opinion about a topic based on accumulated experience.
+    pub fn get_opinion(&self, topic: &str) -> String {
+        self.daemon
+            .as_ref()
+            .map(|d| d.get_opinion(topic))
+            .unwrap_or_else(|| format!("I don't know what '{}' is.", topic))
+    }
+
+    /// Return the system's current interests (high-valence concepts).
+    pub fn get_interests(&self, count: usize) -> Vec<String> {
+        self.daemon
+            .as_ref()
+            .map(|d| d.get_interests(count))
+            .unwrap_or_default()
+    }
+
+    /// Get a short description of the system's current mood.
+    pub fn get_mood(&self) -> String {
+        self.daemon
+            .as_ref()
+            .map(|d| d.get_mood())
+            .unwrap_or_else(|| "Not running.".to_string())
+    }
+
     /// Number of consecutive missed heartbeats.
     pub fn missed_heartbeats(&self) -> u64 {
         self.missed_heartbeats.load(Ordering::Relaxed)
@@ -256,163 +280,64 @@ impl CognitiveLifecycle {
         let mut g = GraphArena::with_capacity(256);
 
         // ── Sensor nodes ──
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "sensor_accelerometer".into(),
-            node_type: NodeType::Sensor,
-            grounding: Grounding::Sensor {
-                sensor_type: "accelerometer".into(),
-                channel: 0,
-                norm: SensorNorm::Clamp { min: 0.0, max: 1.0 },
-            },
-            decay: 0.85,
-            threshold: 2.5,
-            base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::Activates,
-                target: NodeId::from_raw(3),
-                weight_override: None,
-            }],
-        });
+        fn sensor_node(label: &str, sensor_type: &str, channel: u8, norm: SensorNorm, decay: f64, threshold: f64, target: u64) -> GroundedNode {
+            GroundedNode {
+                id: NodeId::ZERO,
+                label: label.into(),
+                node_type: NodeType::Sensor,
+                grounding: Grounding::Sensor { sensor_type: sensor_type.into(), channel, norm },
+                decay, threshold, base_activation: 0.0, edges: vec![Edge { relation: Relation::Activates, target: NodeId::from_raw(target), weight_override: None }],
+                valence: 0.0,
+            }
+        }
 
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "sensor_proximity".into(),
-            node_type: NodeType::Sensor,
-            grounding: Grounding::Sensor {
-                sensor_type: "proximity".into(),
-                channel: 0,
-                norm: SensorNorm::Linear { scale: -0.1, offset: 1.0 },
-            },
-            decay: 0.9,
-            threshold: 1.8,
-            base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::Activates,
-                target: NodeId::from_raw(4),
-                weight_override: None,
-            }],
-        });
+        fn concept_node(label: &str, decay: f64, threshold: f64, edges: Vec<Edge>) -> GroundedNode {
+            GroundedNode {
+                id: NodeId::ZERO, label: label.into(), node_type: NodeType::Concept,
+                grounding: Grounding::Abstract, decay, threshold, base_activation: 0.0, edges,
+                valence: 0.0,
+            }
+        }
 
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "sensor_light".into(),
-            node_type: NodeType::Sensor,
-            grounding: Grounding::Sensor {
-                sensor_type: "light".into(),
-                channel: 0,
-                norm: SensorNorm::Linear { scale: 0.001, offset: 0.0 },
-            },
-            decay: 0.95,
-            threshold: 0.8,
-            base_activation: 0.1,
-            edges: vec![Edge {
-                relation: Relation::Activates,
-                target: NodeId::from_raw(5),
-                weight_override: None,
-            }],
-        });
+        fn action_node(label: &str, intent_template: &str, decay: f64, threshold: f64) -> GroundedNode {
+            GroundedNode {
+                id: NodeId::ZERO, label: label.into(), node_type: NodeType::Action,
+                grounding: Grounding::Action { intent_template: intent_template.into() },
+                decay, threshold, base_activation: 0.0, edges: Vec::new(),
+                valence: 0.0,
+            }
+        }
 
-        // ── Abstract concepts ──
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "concept_movement".into(),
-            node_type: NodeType::Concept,
-            grounding: Grounding::Abstract,
-            decay: 0.9,
-            threshold: 1.2,
-            base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::Implies,
-                target: NodeId::from_raw(6),
-                weight_override: None,
-            }],
-        });
+        fn state_node(label: &str, keyspace: &str, key: &str, decay: f64, edges: Vec<Edge>) -> GroundedNode {
+            GroundedNode {
+                id: NodeId::ZERO, label: label.into(), node_type: NodeType::State,
+                grounding: Grounding::Stored { keyspace: keyspace.into(), key: key.into() },
+                decay, threshold: f64::MAX, base_activation: 0.0, edges,
+                valence: 0.0,
+            }
+        }
 
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "concept_proximity".into(),
-            node_type: NodeType::Concept,
-            grounding: Grounding::Abstract,
-            decay: 0.9,
-            threshold: 1.5,
-            base_activation: 0.0,
-            edges: vec![Edge {
-                relation: Relation::Implies,
-                target: NodeId::from_raw(6),
-                weight_override: Some(0.5),
-            }],
-        });
-
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "concept_darkness".into(),
-            node_type: NodeType::Concept,
-            grounding: Grounding::Abstract,
-            decay: 0.92,
-            threshold: 1.0,
-            base_activation: 0.0,
-            edges: vec![
-                Edge {
-                    relation: Relation::Activates,
-                    target: NodeId::from_raw(7),
-                    weight_override: None,
-                },
-                Edge {
-                    relation: Relation::Activates,
-                    target: NodeId::from_raw(8),
-                    weight_override: None,
-                },
-            ],
-        });
-
-        // ── Action nodes (grounded to Android intents) ──
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "lock_screen".into(),
-            node_type: NodeType::Action,
-            grounding: Grounding::Action {
-                intent_template: r#"{"action":"lockScreen","params":{}}"#.into(),
-            },
-            decay: 0.5,
-            threshold: 1.0,
-            base_activation: 0.0,
-            edges: Vec::new(),
-        });
-
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "toggle_flashlight".into(),
-            node_type: NodeType::Action,
-            grounding: Grounding::Action {
-                intent_template: r#"{"action":"toggleFlashlight","params":{"on":true}}"#.into(),
-            },
-            decay: 0.3,
-            threshold: 1.0,
-            base_activation: 0.0,
-            edges: Vec::new(),
-        });
-
-        // ── State nodes ──
-        g.insert(GroundedNode {
-            id: NodeId::ZERO,
-            label: "state_night_mode".into(),
-            node_type: NodeType::State,
-            grounding: Grounding::Stored {
-                keyspace: "system".into(),
-                key: "night_mode".into(),
-            },
-            decay: 0.99,
-            threshold: f64::MAX,
-            base_activation: 0.0,
-            edges: vec![
-                Edge {
-                    relation: Relation::Inhibits,
-                    target: NodeId::from_raw(8),
-                    weight_override: Some(-0.3),
-                },
-            ],
-        });
+        g.insert(sensor_node("sensor_accelerometer", "accelerometer", 0,
+            SensorNorm::Clamp { min: 0.0, max: 1.0 }, 0.85, 2.5, 3));
+        g.insert(sensor_node("sensor_proximity", "proximity", 0,
+            SensorNorm::Linear { scale: -0.1, offset: 1.0 }, 0.9, 1.8, 4));
+        g.insert(sensor_node("sensor_light", "light", 0,
+            SensorNorm::Linear { scale: 0.001, offset: 0.0 }, 0.95, 0.8, 5));
+        g.insert(concept_node("concept_movement", 0.9, 1.2, vec![
+            Edge { relation: Relation::Implies, target: NodeId::from_raw(6), weight_override: None },
+        ]));
+        g.insert(concept_node("concept_proximity", 0.9, 1.5, vec![
+            Edge { relation: Relation::Implies, target: NodeId::from_raw(6), weight_override: Some(0.5) },
+        ]));
+        g.insert(concept_node("concept_darkness", 0.92, 1.0, vec![
+            Edge { relation: Relation::Activates, target: NodeId::from_raw(7), weight_override: None },
+            Edge { relation: Relation::Activates, target: NodeId::from_raw(8), weight_override: None },
+        ]));
+        g.insert(action_node("lock_screen", r#"{"action":"lockScreen","params":{}}"#, 0.5, 1.0));
+        g.insert(action_node("toggle_flashlight", r#"{"action":"toggleFlashlight","params":{"on":true}}"#, 0.3, 1.0));
+        g.insert(state_node("state_night_mode", "system", "night_mode", 0.99, vec![
+            Edge { relation: Relation::Inhibits, target: NodeId::from_raw(8), weight_override: Some(-0.3) },
+        ]));
 
         g
     }

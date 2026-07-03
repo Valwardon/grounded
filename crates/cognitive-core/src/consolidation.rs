@@ -186,6 +186,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
+            valence: 0.0,
         });
         graph.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -194,6 +195,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(4))],
+            valence: 0.0,
         });
         graph.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -202,6 +204,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![],
+            valence: 0.0,
         });
 
         let report = consolidate(&mut graph);

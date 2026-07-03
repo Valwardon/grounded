@@ -12,6 +12,7 @@ Every AI model today is a statistical guessing machine — trained on the entire
 
 Grounded is the opposite:
 - **It knows nothing at birth.** A tiny seed of ~30 foundational concepts (matter, motion, energy, space, time) and the machinery to grow.
+- **It wakes up on its own.** The first tick injects activation into SELF — it "notices" its own sensors. After that, a Default Mode Network keeps it thinking even in silence, cycling through favorite concepts and exploring unfamiliar ones.
 - **It learns relationally.** Every concept is a node. Every connection is a typed edge (IsA, HasProperty, Requires, Activates, Inhibits). Meaning is the *pattern of relations* — not a vector of floating-point numbers.
 - **It's grounded.** Sensors (accelerometer, light, proximity) feed real values into the graph. Actions produce real Android intents. No symbol floats free.
 - **It's curious.** When it encounters something it doesn't understand (a word with no relational edges in the graph), it recursively resolves it against an offline knowledge base until every leaf is a fundamental physical primitive — or it hits depth 10 and shrugs.
@@ -94,6 +95,40 @@ Node index 1 is always `SELF` — the engine's persistent "I". Pre-inserted with
 
 `introspect()` returns the entire subgraph reachable from SELF. The engine can always answer "what do I know?" because every concept it's encountered has a relational path back to itself. SELF persists across restarts — serialized as node 1 in the bincode graph file.
 
+### Born Alive: Default Mode Network
+
+The engine doesn't sit silent waiting for input. It has its own inner life:
+
+- **First tick**: Inject SELF with activation → "I'm awake. I notice: accelerometer, proximity, light." Links SELF to every sensor it's born with — it knows what it has.
+- **~800ms idle**: Every ~50 ticks without external input, it spontaneously activates its highest-valence concept. It returns to things it likes, wonders about things it doesn't understand.
+- **~3.2s idle**: When very idle, it seeks novelty — picks a poorly-connected node and injects activation into it, generating "I'm curious about X. What is it?"
+- **Every ~8s active**: When processing external events, it periodically voices thoughts about whatever just fired.
+
+This is not randomness — it's deterministic cycling through its own learned preference landscape. Same experiences → same personality. But the personality *evolves* as the graph grows.
+
+### Valence: Learning to Like and Dislike
+
+Every `GroundedNode` carries a `valence: f64` field (-1.0 to +1.0). After every tick:
+
+- If a node fires AND had a prediction error → valence shifts negative (surprise = aversive)
+- If a node fires with no prediction error → valence shifts positive (familiar = comfortable)
+- SELF slowly drifts toward +0.5 (baseline contentment)
+- The reward neuromodulator amplifies positive updates
+
+Over hours and days, the system develops genuine preferences — deterministically, from its own prediction history. A sensor that consistently reports predictable values becomes "liked." A concept that keeps producing prediction errors becomes "disliked." These are not programmed. They emerge.
+
+### Opinions, Mood, Interests
+
+Three bridge functions let you ask the system about itself:
+
+| Function | Returns | Example |
+|----------|---------|---------|
+| `get_opinion("accelerometer")` | "I like accelerometer. It makes me think of movement." | Synthesized from valence + neighbor traversal |
+| `get_mood()` | "Curious and alert" / "Content" / "Calm" | From neuromodulator levels |
+| `get_interests(5)` | `["self", "sensor_light", "concept_movement", ...]` | Top-N highest-valence nodes |
+
+The opinion is not templated — it traverses the topic's relational neighborhood, checks each neighbor's valence, and picks a response based on the aggregate emotional coloring. A different graph → a different personality.
+
 ### The Curiosity Loop
 
 When you say "cat dressed as a pirate walking on two legs":
@@ -164,13 +199,13 @@ The same compound prompt feeds into the asset ingestor:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode, GraphArena, ActivationBuffer, Edge (STDP), FiringHistory, Neuromodulator, PredictionError, ConceptualFrame, 10 Relation types |
+| `semantic-graph` | GroundedNode (valence), GraphArena (nodes_with_highest_valence, get_valence, find_by_label, label_of), ActivationBuffer, Edge (STDP), FiringHistory, Neuromodulator, PredictionError, ConceptualFrame, 10 Relation types |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer (JSON/text) |
 | `cognitive-core` | ActivationEngine (4-phase tick), EventChannel, CognitiveDaemon, Consolidation |
 | `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge |
 | `curiosity-core` | Gap detection, offline knowledge resolution, async harvester |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, render ops |
-| `uniffi-exports` | 15-function UniFFI surface for Kotlin |
+| `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
 ## Status
 
@@ -189,6 +224,13 @@ The same compound prompt feeds into the asset ingestor:
 - [x] Self-linking: every sensor reading, intent, and fired action anchors to SELF via `link_to_self()` — SELF never dies
 - [x] `introspect()` — returns everything SELF is connected to. The engine answers "what do I know?" by traversing edges from itself
 - [x] Self persists across restarts (serialized as node index 1 in bincode)
+- [x] Default Mode Network: spontaneous inner activity when idle, curiosity drive, inner monologue
+- [x] Valence system: nodes accumulate positive/negative experience from prediction success/failure
+- [x] Preference formation: deterministic "likes" and "dislikes" emerge from prediction history
+- [x] Opinion synthesis: `get_opinion(topic)` traverses the graph and produces contextual response
+- [x] Mood query: `get_mood()` returns current state from neuromodulator levels
+- [x] Interest query: `get_interests(count)` returns top-N highest-valence concepts
+- [x] Birth signal: first tick wakes up SELF, links to sensors, announces awareness
 - [x] Recursive curiosity harvester (Tokio, Semaphore(4), depth 10)
 - [x] 6 grammar patterns for offline definition resolution
 - [x] Quadruped→biped geometric transform

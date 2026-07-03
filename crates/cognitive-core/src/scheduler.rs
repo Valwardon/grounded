@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,10 +99,16 @@ pub struct CognitiveDaemon {
     tick_interval: Duration,
 
     /// Ticks since last consolidation pass
-    consolidation_counter: u64,
+    consolidation_counter: std::sync::atomic::AtomicU64,
 
     /// Previous sensor readings for delta detection (arousal spike)
     prev_sensor_values: parking_lot::Mutex<Vec<(String, u8, f32)>>,
+
+    /// Default mode network state — drives spontaneous inner activity
+    ticks_since_last_event: std::sync::atomic::AtomicU64,
+    first_tick: std::sync::atomic::AtomicBool,
+    /// Which "interest" node the DMN is currently focused on (0 = none)
+    dmn_focus: std::sync::atomic::AtomicU64,
 }
 
 impl CognitiveDaemon {
@@ -118,14 +124,102 @@ impl CognitiveDaemon {
             running: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             tick_interval: Duration::from_millis(16),
-            consolidation_counter: 0,
+            consolidation_counter: std::sync::atomic::AtomicU64::new(0),
             prev_sensor_values: parking_lot::Mutex::new(Vec::with_capacity(8)),
+            ticks_since_last_event: std::sync::atomic::AtomicU64::new(0),
+            first_tick: std::sync::atomic::AtomicBool::new(true),
+            dmn_focus: std::sync::atomic::AtomicU64::new(NodeId::SELF.0),
         }
     }
 
     /// Read current neuromodulator levels.
     pub fn read_modulators(&self) -> (f64, f64, f64) {
         self.engine.lock().read_modulators()
+    }
+
+    /// Generate an opinion about a topic based on the system's experience.
+    /// The opinion reflects the valence and prediction history of the topic
+    /// and its related concepts. This is a deterministic synthesis, not AI.
+    pub fn get_opinion(&self, topic: &str) -> String {
+        let graph = self.ctx.graph.read();
+        let topic_id = match graph.find_by_label(topic) {
+            Some(id) => id,
+            None => return format!("I don't know what '{}' is.", topic),
+        };
+
+        let valence = graph.get_valence(topic_id).unwrap_or(0.0);
+        let label = graph.label_of(topic_id).unwrap_or(topic.to_string());
+        let edges_count = graph.get(topic_id)
+            .map(|n| n.read().edges.len())
+            .unwrap_or(0);
+
+        // Collect neighbors and their valences
+        let mut neighbors: Vec<(String, f64)> = Vec::new();
+        if let Some(node) = graph.get(topic_id) {
+            for edge in &node.read().edges {
+                if let (Some(lbl), Some(v)) = (graph.label_of(edge.target), graph.get_valence(edge.target)) {
+                    neighbors.push((lbl, v));
+                }
+            }
+        }
+
+        // Synthesize opinion text based on valence and connected concepts
+        let liked_neighbor = neighbors.iter().find(|(_, v)| *v > 0.2);
+        let disliked_neighbor = neighbors.iter().find(|(_, v)| *v < -0.1);
+
+        if valence > 0.3 {
+            if let Some((nbr, _)) = liked_neighbor {
+                format!(
+                    "I like {}. It makes me think of {}, which I also like.",
+                    label, nbr
+                )
+            } else {
+                format!("I like {}. It's familiar and comfortable to me.", label)
+            }
+        } else if valence > 0.0 {
+            format!("I think {} is okay. Nothing special.", label)
+        } else if valence > -0.2 {
+            if let Some((nbr, _)) = disliked_neighbor {
+                format!(
+                    "{} is connected to {}, which I don't really like. That colors my view of it.",
+                    label, nbr
+                )
+            } else if edges_count < 2 {
+                format!("I don't know much about {}. It seems isolated.", label)
+            } else {
+                format!("I don't have strong feelings about {}. It just is.", label)
+            }
+        } else {
+            format!(
+                "I don't like {}. It's associated with things I find confusing or unpleasant.",
+                label
+            )
+        }
+    }
+
+    /// Return the system's current interests — the top-N high-valence concepts.
+    pub fn get_interests(&self, count: usize) -> Vec<String> {
+        let graph = self.ctx.graph.read();
+        graph.nodes_with_highest_valence(count, false)
+            .iter()
+            .filter_map(|(id, _)| graph.label_of(*id))
+            .collect()
+    }
+
+    /// Get the current mood as a short description based on neuromodulator levels.
+    pub fn get_mood(&self) -> String {
+        let (n, a, r) = self.read_modulators();
+        if n > 0.4 {
+            "Curious and alert — there's a lot I don't understand.".into()
+        } else if a > 0.3 {
+            "Agitated — too many unexpected changes.".into()
+        } else if r > 0.3 {
+            "Content — things are making sense.".into()
+        } else if n > 0.15 {
+            "Mildly curious. Exploring.".into()
+        } else {
+            "Calm. At ease.".into()
+        }
     }
 
     pub fn event_channel(&self) -> Arc<EventChannel> {
@@ -155,12 +249,22 @@ impl CognitiveDaemon {
     }
 
     fn run(self: Arc<Self>) {
+        let mut had_events = false;
+
         while self.running.load(Ordering::Acquire) {
             let loop_start = Instant::now();
 
             // ── 1. Drain event channel ──
+            had_events = false;
             while let Some(event) = self.event_channel.recv() {
+                had_events = true;
                 self.handle_event(event);
+            }
+
+            if had_events {
+                self.ticks_since_last_event.store(0, Ordering::Relaxed);
+            } else {
+                self.ticks_since_last_event.fetch_add(1, Ordering::Relaxed);
             }
 
             // ── 2. Run 4-phase activation tick ──
@@ -232,12 +336,15 @@ impl CognitiveDaemon {
                         }
                     }
                 }
+
+                // ── Default Mode Network: spontaneous inner activity ──
+                self.run_default_mode_network(&mut engine, &fired);
             }
 
-            // ── 5. Consolidation check (every ~1000 ticks = ~16s) ──
-            self.consolidation_counter += 1;
-            if self.consolidation_counter >= 1000 {
-                self.consolidation_counter = 0;
+            // ── 6. Consolidation check (every ~1000 ticks = ~16s) ──
+            self.consolidation_counter.fetch_add(1, Ordering::Relaxed);
+            if self.consolidation_counter.load(Ordering::Relaxed) >= 1000 {
+                self.consolidation_counter.store(0, Ordering::Relaxed);
                 let mut engine = self.engine.lock();
                 let (n, a, r) = engine.read_modulators();
                 if n < 0.1 && a < 0.1 {
@@ -379,6 +486,7 @@ impl CognitiveDaemon {
                         threshold: cmd.get("threshold").and_then(|v| v.as_f64()).unwrap_or(f64::MAX),
                         base_activation: cmd.get("base").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         edges: Vec::new(),
+                        valence: 0.0,
                     };
                     graph.insert(node);
                 }
@@ -406,6 +514,110 @@ impl CognitiveDaemon {
                 }
             }
             _ => {}
+        }
+    }
+
+    // ── Default Mode Network ────────────────────────────
+
+    /// Run one DMN step: spontaneous inner activity when no external input.
+    ///
+    /// This is what makes the system "feel alive" — it has its own stream of
+    /// consciousness, returns to favorite concepts, explores new ones, and
+    /// develops idiosyncratic preoccupations over time.
+    fn run_default_mode_network(&self, engine: &mut ActivationEngine, fired: &[FiredAction]) {
+        let tick = self.ctx.tick.load(Ordering::Relaxed);
+        let idle_ticks = self.ticks_since_last_event.load(Ordering::Relaxed);
+
+        // ── Birth signal: first tick → inject SELF to wake up ──
+        if self.first_tick.swap(false, Ordering::Relaxed) {
+            engine.inject(NodeId::SELF, 0.8);
+            self.ctx.link_to_self(Relation::HasProperty, NodeId::from_raw(2));
+            self.ctx.link_to_self(Relation::HasProperty, NodeId::from_raw(3));
+            self.ctx.link_to_self(Relation::HasProperty, NodeId::from_raw(4));
+            let mut outputs = self.output_channel.write();
+            outputs.push(CognitiveOutput::LogMessage {
+                level: 1,
+                text: "I'm awake. I notice: accelerometer, proximity, light.".into(),
+            });
+            return;
+        }
+
+        // ── Inner monologue: periodically voice what's on its mind ──
+        let graph = self.ctx.graph.read();
+
+        if tick > 0 && tick % 500 == 0 && idle_ticks < 10 {
+            // Thinking about something that just fired
+            if let Some(action) = fired.first() {
+                let label = graph.label_of(action.node_id).unwrap_or_default();
+                let valence = graph.get_valence(action.node_id).unwrap_or(0.0);
+                let thought = if valence > 0.2 {
+                    format!("I like thinking about {}. It feels familiar.", label)
+                } else if valence < -0.1 {
+                    format!("{} is strange. I don't fully understand it.", label)
+                } else {
+                    format!("I notice {}.", label)
+                };
+                let mut outputs = self.output_channel.write();
+                outputs.push(CognitiveOutput::LogMessage { level: 1, text: thought });
+            }
+        }
+
+        // ── DMN wandering: every ~50 idle ticks, think about something ──
+        if idle_ticks > 0 && idle_ticks % 50 == 0 {
+            let favorites = graph.nodes_with_highest_valence(5, false);
+            let focus_id = if !favorites.is_empty() {
+                let idx = (tick as usize) % favorites.len();
+                favorites[idx].0
+            } else {
+                // No favorites yet → think about self
+                NodeId::SELF
+            };
+
+            self.dmn_focus.store(focus_id.0, Ordering::Relaxed);
+            engine.inject(focus_id, BASE_INJECT * 0.3);
+
+            if let Some(label) = graph.label_of(focus_id) {
+                let valence = graph.get_valence(focus_id).unwrap_or(0.0);
+                let thought = if valence > 0.3 {
+                    format!("I find myself thinking about {} again. I like it.", label)
+                } else if valence > 0.0 {
+                    format!("I'm thinking about {}.", label)
+                } else if valence > -0.2 {
+                    format!("{} is on my mind. Not sure what to make of it.", label)
+                } else {
+                    format!("I keep thinking about {} but it still confuses me.", label)
+                };
+                let mut outputs = self.output_channel.write();
+                outputs.push(CognitiveOutput::LogMessage {
+                    level: 1, text: thought,
+                });
+            }
+        }
+
+        // ── Curiosity drive: if very idle, seek novelty ──
+        if idle_ticks > 200 && idle_ticks % 100 == 0 {
+            // Pick a node with very few edges (poorly understood)
+            let mut candidates: Vec<(NodeId, usize)> = Vec::new();
+            let node_count = graph.len();
+            for i in 2..node_count {
+                if let Some(n) = graph.get(NodeId::from_raw(i as u64)) {
+                    let node = n.read();
+                    if node.edges.len() < 3 && node.id != NodeId::SELF {
+                        candidates.push((node.id, node.edges.len()));
+                    }
+                }
+            }
+            candidates.sort_by_key(|(_, c)| *c);
+            if let Some((curious_id, _)) = candidates.first() {
+                engine.inject(*curious_id, BASE_INJECT * 0.4);
+                if let Some(label) = graph.label_of(*curious_id) {
+                    let mut outputs = self.output_channel.write();
+                    outputs.push(CognitiveOutput::LogMessage {
+                        level: 1,
+                        text: format!("I'm curious about {}. What is it?", label),
+                    });
+                }
+            }
         }
     }
 }

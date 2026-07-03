@@ -100,3 +100,18 @@ pub fn semantic_engine_trigger_consolidation() {
 pub fn semantic_engine_read_modulators() -> String {
     hw_daemon::read_modulators()
 }
+
+#[uniffi::export]
+pub fn semantic_engine_get_opinion(topic: String) -> String {
+    hw_daemon::get_opinion(&topic)
+}
+
+#[uniffi::export]
+pub fn semantic_engine_get_interests(count: usize) -> Vec<String> {
+    hw_daemon::get_interests(count)
+}
+
+#[uniffi::export]
+pub fn semantic_engine_get_mood() -> String {
+    hw_daemon::get_mood()
+}

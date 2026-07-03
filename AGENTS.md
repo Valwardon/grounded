@@ -16,6 +16,8 @@ A non-AI, deterministic cognitive system that runs 100% on-device. No tokens, no
 
 5. **Deterministic** — No random numbers. No probability. Same input → same output, always. Every algorithm is O(E) bounded-time, no fallbacks, no guesswork.
 
+6. **Alive at Birth** — The engine doesn't sit silent. It wakes up on tick 0 (birth signal), spontaneously activates its own concepts when idle (Default Mode Network), forms preferences via valence accumulation, and can report opinions, mood, and interests through bridge functions.
+
 ## Architecture
 
 ```
@@ -120,6 +122,35 @@ Every Edge now carries:
 - `eligibility: f64` — Hebbian trace (decay 0.9, boost on source fire, consume on target fire)
 - `default_weight()` — what dynamic_weight drifts toward between LTP events
 
+### Phase 5 — Valence Update (preference formation)
+After STDP + pruning, the engine runs a fifth phase every tick:
+
+- Nodes that fired WITH a prediction error this tick → negative valence drift (target -0.3, rate 0.05)
+- Nodes that fired WITHOUT a prediction error → positive valence drift proportional to reward (target 0.2 + reward*0.3, rate 0.02)
+- Nodes that received injection but didn't fire → mild positive (target 0.1, rate 0.01)
+- SELF → constant slow drift toward +0.5 (baseline contentment)
+
+Over time, this creates deterministic preferences — the system "likes" what it can predict and "dislikes" what surprises it. Same graph history → same personality.
+
+### Default Mode Network (spontaneous inner activity)
+Runs after every tick when the engine is idle:
+
+| Condition | Behavior |
+|-----------|----------|
+| **Tick 0** | Birth signal: inject SELF at 0.8, link to all sensors, log "I'm awake." |
+| **Every 500 ticks, active** | Inner monologue: voice a thought about whatever just fired (valence-colored) |
+| **Every 50 idle ticks** | DMN wandering: pick top-5 valence node, inject activation, log thinking about it |
+| **Every 100 idle ticks (>200 idle)** | Curiosity drive: find node with fewest edges, inject, log curiosity |
+
+This is what makes the engine "feel alive" — it has its own stream of consciousness, returns to favorite concepts, and gets curious about things it doesn't understand.
+
+### Valence → Opinion Bridge
+Three bridge functions export the system's inner state:
+
+- `get_opinion(topic)` — looks up topic node, traverses neighbors, checks their valence, synthesizes response: "I like X, it reminds me of Y" / "X is confusing" / "I don't know what X is"
+- `get_mood()` — reads neuromodulator levels and returns: "Curious and alert" / "Agitated" / "Content" / "Calm"
+- `get_interests(N)` — returns labels of top-N nodes by valence
+
 ### Consolidation (sleep loop)
 Triggered every ~1000 ticks (~16s) when novelty < 0.1 AND arousal < 0.1:
 - `GraphArena::garbage_collect_edges()` — remove edges below PRUNE_THRESHOLD (0.005)
@@ -129,9 +160,9 @@ Triggered every ~1000 ticks (~16s) when novelty < 0.1 AND arousal < 0.1:
 ## Crate Map
 
 ### Core (semantic-graph)
-- `GroundedNode` — label, type (Entity/Concept/Action/Sensor/State/Frame), `Grounding` enum (Sensor/Action/Stored/HardwareQuery/Abstract), decay, threshold, edges
+- `GroundedNode` — label, type (Entity/Concept/Action/Sensor/State/Frame), `Grounding` enum (Sensor/Action/Stored/HardwareQuery/Abstract), decay, threshold, edges, **`valence: f64`** (-1.0 to +1.0, running average of positive/negative experience)
 - `Edge` — relation, target, weight_override, `dynamic_weight` (STDP), `eligibility` (Hebbian trace), `default_weight()`, `effective_weight()` (reads dynamic_weight)
-- `GraphArena` — `Vec<RwLock<GroundedNode>>` + label index. O(1) access by NodeId, `garbage_collect_edges()` for pruning
+- `GraphArena` — `Vec<RwLock<GroundedNode>>` + label index. O(1) access by NodeId, `garbage_collect_edges()` for pruning. New methods: `get_valence()`, `set_valence()`, `update_valence()`, `nodes_with_highest_valence()`, `find_by_label()`, `label_of()`
 - `ActivationBuffer` — two `Box<[f64]>` arrays flipped atomically. Writer writes to back, flips, reader reads from front
 - `FiringHistory` — ring buffer of `LTP_WINDOW=4` ticks, bitset storage, zero-alloc in hot path
 - `Neuromodulator` — novelty/arousal/reward channels with decay, spike(), `threshold_modifier()`, `plasticity_modifier()`
@@ -146,10 +177,14 @@ Triggered every ~1000 ticks (~16s) when novelty < 0.1 AND arousal < 0.1:
 - `Realizer` — template-based frame→AndroidIntent JSON or display text
 
 ### Cognitive Core (cognitive-core)
-- `ActivationEngine::tick()` — 4-phase tick (neuromodulator decay / prediction error / spread+eligibility / STDP+pruning)
+- `ActivationEngine::tick()` — 5-phase tick (neuromodulator decay / prediction error / spread+eligibility / STDP+pruning / valence update)
 - `ActivationEngine` — owns `Neuromodulator`, `FiringHistory`, predictions[] array, fired_this_tick bitset
 - `EventChannel` — 128-slot SPSC ring buffer, lock-free
 - `CognitiveDaemon` — background thread, 16ms tick, event drain→tick→dispatch, arousal spike on sensor delta, reward tonic on stable predictions, consolidation every ~1000 ticks, `read_modulators()`
+- `CognitiveDaemon::get_opinion(topic)` — traverses topic node + neighbors, checks valence, synthesizes deterministic opinion text
+- `CognitiveDaemon::get_interests(count)` — returns top-N highest-valence node labels
+- `CognitiveDaemon::get_mood()` — returns mood description from neuromodulator levels
+- `CognitiveDaemon::run_default_mode_network()` — spontaneous inner activity: birth signal on tick 0, inner monologue every 500 ticks, DMN wandering to favorites every 50 idle ticks, curiosity drive to poorly-connected nodes every 100 very-idle ticks
 - `consolidate()` — edge GC + linear chain compression (sleep loop)
 
 ### Hardware Daemon (hw-daemon)
@@ -172,7 +207,7 @@ Triggered every ~1000 ticks (~16s) when novelty < 0.1 AND arousal < 0.1:
 - BASE_SKELETONS: human, quadruped, bird, fish with joint names
 
 ### UniFFI Exports (uniffi-exports)
-15 exported functions: `init`, `start`, `stop`, `feed_sensor`, `feed_intent`, `drain_outputs`, `is_running`, `trim_memory`, `keepalive`, `missed_heartbeats`, `inspect_prompt`, `tick_count`, `modulate`, `trigger_consolidation`, `read_modulators`
+18 exported functions: `init`, `start`, `stop`, `feed_sensor`, `feed_intent`, `drain_outputs`, `is_running`, `trim_memory`, `keepalive`, `missed_heartbeats`, `inspect_prompt`, `tick_count`, `modulate`, `trigger_consolidation`, `read_modulators`, `get_opinion`, `get_interests`, `get_mood`
 
 ## File Layout
 

@@ -169,6 +169,7 @@ mod tests {
                     weight_override: None,
                 },
             ],
+            valence: 0.0,
         });
 
         // Grounded: animal
@@ -185,6 +186,7 @@ mod tests {
                 target: NodeId::from_raw(3),
                 weight_override: None,
             }],
+            valence: 0.0,
         });
 
         // Grounded: quadruped (primitive — has edges)
@@ -201,6 +203,7 @@ mod tests {
                 target: cat_id,
                 weight_override: None,
             }],
+            valence: 0.0,
         });
 
         SemanticContext::new(g)
