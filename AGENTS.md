@@ -673,6 +673,27 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - Imports: `SelfHealingHook`, `SelfHealingPipeline`, `ModuleRegistry`, `Constraint`.
 - **`StockCognitiveParser::parse()` metrics bug fixed** — `self.metrics.clone()` → `self.metrics.record_sample()` (clone was updating a temporary). Success polarity: `0.0` for empty frames, `1.0` for non-empty.
 
+### episodic-memory crate (new, this session)
+- `record.rs` — `RawEpisodicRecord` (8 × u64 = 64 bytes, one cache line), `AtomicRecord` (8 × AtomicU64), `EventType` discriminants (NodeFired, PredictionError, StructuralFault, SensorReading, IntentProcessed), `pack_meta()` for bit-packing novelty/arousal/reward + type into one u64.
+- `ring.rs` — `EpisodicRingBuffer` (lock-free SPSC, 1024 slots × 64 bytes = 64 KB). Writer stores fields with Relaxed ordering, meta field with Release to commit. Reader loads meta with Acquire, clears tick to mark consumed. Zero-allocation hot path.
+- `consolidation.rs` — `consolidate_episodes()` drains ring buffer, groups temporally adjacent records (tick gap ≤ 5) into clusters, computes importance (prediction errors = 0.4, faults = 0.5, novelty = 0.3×, arousal = 0.2×, reward = 0.15×, density = 0.15×), promotes clusters above `EPISODE_IMPORTANCE_THRESHOLD` (0.15) as `GroundedNode::Episode` nodes. Uses `Relation::Experienced` to link SELF, `Relation::Precedes` to chain episodes, `Relation::AssociatedWith` for involved nodes.
+- `query.rs` — `query_all_episodes()`, `query_recent()`, `query_tick_range()`, `query_by_node_label()`. All scan SELF's `Relation::Experienced` edges and extract episode metadata from `Grounding::Episode` variants.
+- `history.rs` — `EpisodicHistory` implements `cognitive_core::EpisodicRecorder`. Maps each `EpisodicEvent` variant to a packed `RawEpisodicRecord` and pushes to ring buffer.
+
+### cognitive-core additions (this session)
+- `EpisodicRecorder` trait (`scheduler.rs`) — `record(&self, EpisodicEvent)` (lock-free hot path), `consolidate(&self)` (idle cycle), `last_summary() -> String`.
+- `EpisodicEvent` enum — 5 lightweight variants (`NodeFired`, `PredictionError`, `StructuralFault`, `SensorReading`, `IntentProcessed`), each carrying neuromodulator snapshot (novelty/arousal/reward) for importance computation.
+- `CognitiveDaemon::episodic_recorder` — `parking_lot::Mutex<Option<Box<dyn EpisodicRecorder>>>` field. `set_episodic_recorder()` setter.
+- Tick loop wiring: after Phase 6 (line ~507), records fired nodes and prediction errors via `recorder.record()`. During idle consolidation, calls `recorder.consolidate()` alongside garbage collection and self-healing.
+- Event handling wiring: `IntentProcessed` and `SensorReading` events recorded after handler releases engine lock.
+- `hash_str()` helper — deterministic FNV-like string → u64 hash for sensor/intent event identification.
+
+### semantic-graph additions (this session)
+- `NodeType::Episode` — new variant for episodic memory nodes.
+- `Relation::Experienced` — links SELF to Episode nodes (spread_weight=0.8, contract=Unspecified).
+- `Grounding::Episode { tick, timestamp_ms, importance }` — structured metadata on episode nodes.
+- `Grounding::Episode` variant added to `Grounding` enum.
+
 ## Critical Rules for Agent
 
 1. NEVER add randomness, probability, or ML. Every decision is deterministic graph math, CCG reduction, or table lookup.
@@ -696,3 +717,4 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 19. TransientWorkspace edges must be skipped in all consolidation passes: `extract_edge_signature`, `compress_linear_chains`, `synthesize_categories`, and `garbage_collect_edges`. They are ephemeral by design.
 20. Counterfactual mode must short-circuit both Phase 4 (STDP) and Phase 5 (valence). Phase 3 and Phase 6 must still run normally. Do not skip event processing in counterfactual mode.
 21. Predictive-role profiles are bounded at 128 nodes. Never run unbounded BFS. Profile extraction uses a `Vec<u64>` frontier, not recursion.
+22. Episodic memory writes are lock-free SPSC only. The cognitive daemon (single writer) pushes `RawEpisodicRecord` to the ring buffer — no locks, no allocations. The consolidation pass (single reader, idle cycle) drains the buffer and promotes to the graph. Never read/write the ring buffer from multiple threads.

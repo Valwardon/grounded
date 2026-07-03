@@ -201,6 +201,9 @@ pub enum Relation {
     /// Connects a TransientObservation node to a StableBelief node.
     /// Observations feed beliefs; beliefs accumulate confidence over time.
     SupportsBelief,
+    /// Links SELF to an Episode node — "I experienced this event."
+    /// Used by the episodic memory system for timeline recollection.
+    Experienced,
 }
 
 impl Relation {
@@ -217,6 +220,7 @@ impl Relation {
             Relation::Inhibits => -0.6,
             Relation::AssociatedWith => 0.3,
             Relation::SupportsBelief => 0.6,
+            Relation::Experienced => 0.8,
         }
     }
 
@@ -250,6 +254,7 @@ impl Relation {
                 output_type: DataType::State,
                 input_type: DataType::State,
             },
+            Relation::Experienced => InvariantContract::Unspecified,
         }
     }
 }
@@ -299,6 +304,15 @@ pub enum Grounding {
     /// a rendering parameter (scale, rotation, color, wireframe).
     VisualPrimitive {
         primitive_type: VisualPrimitiveType,
+    },
+    /// Episodic memory record — a lived event in the system's timeline.
+    /// tick: global tick counter when the event occurred.
+    /// timestamp_ms: wall clock epoch ms.
+    /// importance: 0.0–1.0 computed from prediction error + valence shift magnitude.
+    Episode {
+        tick: u64,
+        timestamp_ms: u64,
+        importance: f64,
     },
     Abstract,
 }
@@ -403,7 +417,7 @@ pub struct GroundedNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeType {
-    Entity, Concept, Action, Sensor, State, Frame, VisualPrimitive,
+    Entity, Concept, Action, Sensor, State, Frame, VisualPrimitive, Episode,
 }
 
 // ────────────────────────────────────────────────────────────

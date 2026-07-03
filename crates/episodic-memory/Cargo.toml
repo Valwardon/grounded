@@ -1,0 +1,10 @@
+[package]
+name = "episodic-memory"
+version.workspace = true
+edition.workspace = true
+description = "Continuous timeline of lived experience — lock-free ring buffer + semantic graph promotion"
+
+[dependencies]
+semantic-graph = { path = "../semantic-graph" }
+cognitive-core = { path = "../cognitive-core" }
+parking_lot.workspace = true

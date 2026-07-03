@@ -8,6 +8,8 @@ members = [
     "crates/curiosity-core",
     "crates/asset-ingestor",
     "crates/uniffi-exports",
+    "crates/metacognition",
+    "crates/episodic-memory",
 ]
 
 [workspace.dependencies]

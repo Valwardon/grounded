@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
-use cognitive_core::{CognitiveDaemon, SelfHealingHook};
+use cognitive_core::{CognitiveDaemon, EpisodicRecorder, SelfHealingHook};
+use episodic_memory::EpisodicHistory;
 use metacognition::{SelfHealingPipeline, ModuleRegistry, Constraint};
 use semantic_graph::prelude::*;
 use crate::render_bridge::{RenderBridge, NullRenderBackend};
@@ -105,6 +106,12 @@ impl CognitiveLifecycle {
 
         // Attach the pipeline to the daemon's idle consolidation pass
         daemon.set_self_healing_hook(Box::new(pipeline));
+
+        // ── Initialize the episodic memory system ──
+        // Records events during the tick loop and consolidates important
+        // episodes into the semantic graph during idle cycles.
+        let history = EpisodicHistory::new(ctx.clone());
+        daemon.set_episodic_recorder(Box::new(history));
     }
 
     /// Start the cognitive background loop + render bridge.

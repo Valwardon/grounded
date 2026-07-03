@@ -44,6 +44,68 @@ pub trait SelfHealingHook: Send {
     fn run_self_healing(&mut self) -> String;
 }
 
+/// Lightweight event for hot-path episodic recording during the tick loop.
+///
+/// Each variant carries the neuromodulator snapshot at the time of the event
+/// so the episodic memory system can compute importance (surprise = novelty spike,
+/// emotional impact = arousal, satisfaction = reward) during consolidation.
+#[derive(Debug, Clone, Copy)]
+pub enum EpisodicEvent {
+    NodeFired {
+        node_id: u64,
+        activation: f32,
+        novelty: f32,
+        arousal: f32,
+        reward: f32,
+    },
+    PredictionError {
+        node_id: u64,
+        error_magnitude: f32,
+        novelty: f32,
+        arousal: f32,
+        reward: f32,
+    },
+    StructuralFault {
+        fault_type: u8,
+        novelty: f32,
+        arousal: f32,
+        reward: f32,
+    },
+    SensorReading {
+        sensor_hash: u64,
+        value: f32,
+        novelty: f32,
+        arousal: f32,
+        reward: f32,
+    },
+    IntentProcessed {
+        intent_hash: u64,
+        novelty: f32,
+        arousal: f32,
+        reward: f32,
+    },
+}
+
+/// Trait for the episodic memory system.
+///
+/// Implemented by episodic_memory::history::EpisodicHistory.
+/// The daemon calls record() during the tick loop (hot path, must be lock-free)
+/// and consolidate() during idle cycles to promote important episodes into the
+/// semantic graph as GroundedNode::Episode nodes linked to SELF via Relation::Experienced.
+pub trait EpisodicRecorder: Send {
+    /// Record a single episodic event during the tick loop.
+    /// Must be lock-free and non-allocating (writes to a fixed-size ring buffer).
+    fn record(&self, event: EpisodicEvent);
+
+    /// Consolidate the ring buffer into the semantic graph.
+    /// Promotes high-importance events as Episode nodes.
+    /// Runs during idle consolidation (novelty < 0.1, arousal < 0.1).
+    fn consolidate(&self);
+
+    /// Return a human-readable summary of the last consolidation pass.
+    fn last_summary(&self) -> String;
+}
+
 #[derive(Debug, Clone)]
 pub enum CognitiveEvent {
     Intent { source: String, json: String, timestamp_ms: u64 },
@@ -152,6 +214,11 @@ pub struct CognitiveDaemon {
     /// Called during idle consolidation to detect and remedy performance
     /// regressions in Layer 1 cognitive modules.
     self_healing_hook: parking_lot::Mutex<Option<Box<dyn SelfHealingHook>>>,
+
+    /// Optional episodic memory recorder.
+    /// record() called during the tick loop for lock-free event logging.
+    /// consolidate() called during idle consolidation to promote episodes.
+    episodic_recorder: parking_lot::Mutex<Option<Box<dyn EpisodicRecorder>>>,
 }
 
 impl CognitiveDaemon {
@@ -181,6 +248,7 @@ impl CognitiveDaemon {
             first_tick: std::sync::atomic::AtomicBool::new(true),
             dmn_focus: std::sync::atomic::AtomicU64::new(NodeId::SELF.0),
             self_healing_hook: parking_lot::Mutex::new(None),
+            episodic_recorder: parking_lot::Mutex::new(None),
         }
     }
 
@@ -293,6 +361,12 @@ impl CognitiveDaemon {
         *self.self_healing_hook.lock() = Some(hook);
     }
 
+    /// Attach an episodic memory recorder.
+    /// Records events during the tick loop and consolidates during idle cycles.
+    pub fn set_episodic_recorder(&self, recorder: Box<dyn EpisodicRecorder>) {
+        *self.episodic_recorder.lock() = Some(recorder);
+    }
+
     /// Set the cognitive mode for the next tick.
     /// Counterfactual mode short-circuits STDP and valence updates,
     /// allowing "what if" simulation without long-term memory changes.
@@ -336,11 +410,17 @@ impl CognitiveDaemon {
 
             // ── 2. Run 4-phase activation tick ──
             let mut prediction_errors: Vec<PredictionError> = Vec::new();
+            let mut fired_actions: Vec<FiredAction> = Vec::new();
+            let mut mod_n: f64 = 0.0;
+            let mut mod_a: f64 = 0.0;
+            let mut mod_r: f64 = 0.0;
             if !self.paused.load(Ordering::Acquire) {
                 let mut engine = self.engine.lock();
 
                 let fired = engine.tick().to_vec();
+                fired_actions = fired.clone();
                 prediction_errors = engine.prediction_errors.clone();
+                (mod_n, mod_a, mod_r) = engine.read_modulators();
 
                 // ── 3. Process prediction errors → novelty spikes ──
                 //     Low prediction error over several consecutive ticks → reward signal
@@ -428,6 +508,28 @@ impl CognitiveDaemon {
                 self.run_default_mode_network(&mut engine, &fired);
             }
 
+            // ── Episodic recording (events from this tick) ──
+            if let Some(ref recorder) = *self.episodic_recorder.lock() {
+                for action in &fired_actions {
+                    recorder.record(EpisodicEvent::NodeFired {
+                        node_id: action.node_id.0,
+                        activation: action.activation_level as f32,
+                        novelty: mod_n as f32,
+                        arousal: mod_a as f32,
+                        reward: mod_r as f32,
+                    });
+                }
+                for err in &prediction_errors {
+                    recorder.record(EpisodicEvent::PredictionError {
+                        node_id: err.node_id.0,
+                        error_magnitude: err.error_magnitude as f32,
+                        novelty: mod_n as f32,
+                        arousal: mod_a as f32,
+                        reward: mod_r as f32,
+                    });
+                }
+            }
+
             // ── 6. Consolidation check (every ~1000 ticks = ~16s) ──
             self.consolidation_counter.fetch_add(1, Ordering::Relaxed);
             if self.consolidation_counter.load(Ordering::Relaxed) >= 1000 {
@@ -458,6 +560,21 @@ impl CognitiveDaemon {
                             text: summary,
                         });
                     }
+
+                    // ── Episodic memory consolidation (if attached) ──
+                    // Promote high-importance events from the ring buffer into
+                    // the semantic graph as Episode nodes linked to SELF.
+                    if let Some(ref recorder) = *self.episodic_recorder.lock() {
+                        recorder.consolidate();
+                        let summary = recorder.last_summary();
+                        if !summary.is_empty() {
+                            let mut outputs = self.output_channel.write();
+                            outputs.push(CognitiveOutput::LogMessage {
+                                level: 1,
+                                text: summary,
+                            });
+                        }
+                    }
                 }
             }
 
@@ -484,12 +601,23 @@ impl CognitiveDaemon {
             }
             CognitiveEvent::Intent { json, .. } => {
                 let parsed = parse_intent(&json);
+                let intent_hash = hash_str(&json);
                 let mut engine = self.engine.lock();
                 for frame in &parsed.frames {
                     engine.inject_frame(frame, BASE_INJECT * parsed.confidence);
                 }
                 if let Some(obj) = parsed.frames.first().and_then(|f| f.object) {
                     self.ctx.link_to_self(Relation::HasProperty, obj);
+                }
+                let (n, a, r) = engine.read_modulators();
+                drop(engine);
+                if let Some(ref recorder) = *self.episodic_recorder.lock() {
+                    recorder.record(EpisodicEvent::IntentProcessed {
+                        intent_hash,
+                        novelty: n as f32,
+                        arousal: a as f32,
+                        reward: r as f32,
+                    });
                 }
             }
             CognitiveEvent::SensorReading { sensor, channel, value, .. } => {
@@ -548,6 +676,18 @@ impl CognitiveDaemon {
                 }
                 if let Some(inst) = parsed.frames.first().and_then(|f| f.instrument) {
                     self.ctx.link_to_self(Relation::GroundedIn, inst);
+                }
+                let (n, a, r) = engine.read_modulators();
+                drop(engine);
+                let sensor_hash = hash_str(&sensor);
+                if let Some(ref recorder) = *self.episodic_recorder.lock() {
+                    recorder.record(EpisodicEvent::SensorReading {
+                        sensor_hash,
+                        value,
+                        novelty: n as f32,
+                        arousal: a as f32,
+                        reward: r as f32,
+                    });
                 }
             }
             CognitiveEvent::TimerElapsed { timer_id } => {
@@ -758,4 +898,17 @@ impl CognitiveDaemon {
             }
         }
     }
+}
+
+// ── Helpers ───────────────────────────────────────────────
+
+/// Deterministic string hash for episodic event identification.
+/// Simple FNV-like hash — no std hash needed, no collision resistance required.
+fn hash_str(s: &str) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in s.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
 }

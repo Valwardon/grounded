@@ -215,6 +215,40 @@ The candidate patch is expressed as **DSL bytecode** (18 safe opcodes, `#![no_st
 
 When the DeficiencyScanner reports a persistent constraint violation, the **metacognitive curiosity divert** routes budget inward: `E_consume = 0.3·dist(SELF, concept) + 0.4·arousal + 0.2·error_rate + 0.1·deficiency_severity`. At severity > 0.3, at least 30% of the curiosity budget goes to internal optimization instead of external exploration.
 
+### Episodic Memory — A Timeline of Lived Experience
+
+Beyond the semantic graph's conceptual knowledge, the engine records a continuous timeline of events. Every tick, during Phase 6, it writes a 64-byte record into a lock-free SPSC ring buffer (1024 slots):
+
+```
+Fired Node A (activation 0.73, novelty 0.2, arousal 0.1)
+  ↓
+Prediction Error on Node B (magnitude 0.45, novelty spike 0.3)
+  ↓
+Sensor Reading "accelerometer[0]" = 0.82
+  ↓
+  ...
+```
+
+During idle consolidation (novelty < 0.1, arousal < 0.1), the ring buffer is drained and events are grouped into episode clusters (temporally adjacent events within 5 ticks of each other). Each cluster's **importance** is computed deterministically:
+
+| Factor | Weight | Source |
+|--------|--------|--------|
+| Prediction error present | +0.40 | Surprise = important |
+| Structural fault present | +0.50 | Failure = very important |
+| Peak novelty | ×0.30 | Emotional salience |
+| Peak arousal | ×0.20 | Physiological response |
+| Peak reward | ×0.15 | Success signal |
+| Event density (max 10) | ×0.15 | Richness of experience |
+
+Clusters above `0.15` importance are promoted into the graph as `NodeType::Episode` nodes with `Grounding::Episode { tick, timestamp_ms, importance }`. SELF links to each episode via `Relation::Experienced`. Episodes are chained in temporal order via `Relation::Precedes`. Involved nodes receive `Relation::AssociatedWith` edges back to the episode.
+
+The query API supports recollection:
+- `query_recent(graph, 10)` — last 10 episodes
+- `query_tick_range(graph, 1000, 2000)` — episodes within a tick window
+- `query_by_node_label(graph, "concept_movement")` — episodes involving a specific node
+
+This gives the engine a genuine, queryable past — not just conceptual knowledge, but *memory of what happened and when*.
+
 ### The Self Node
 
 Node index 1 is always `SELF` — the engine's persistent "I". Pre-inserted with base activation 1.0 and decay 1.0, it never fades. Every experience attaches here:
@@ -429,10 +463,11 @@ After every tick's valence update:
 |-------|---------|
 | `semantic-graph` | GroundedNode (valence, **mean_error**, **variance**, **epistemic_status**), GraphArena (**path_cache**: 16-slot `CachedPath` with interior mutability, **link_workspace()**, **garbage_collect_transient_edges()**), ActivationBuffer, Edge (STDP, contract, **TransientWorkspace**), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 12 Relation types (added **SupportsBelief**), 3 **EpistemicStatus** variants + **CognitiveMode** enum, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives, **VisualPrimitiveType** (6 visual primitive variants), **Grounding::VisualPrimitive**, **FixedVisualPayload** (6 f64 fields), **VisualPrimitiveRingBuffer** (lock-free SPSC, 64 slots) |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer, **CCG RelationalParser** (shift-reduce, semantic categories, 7 reduction rules, proximity fallback) |
-| `cognitive-core` | ActivationEngine (6-phase tick: **precision-weighted prediction error**, **workspace resonance**, **epistemic gating**, **belief confidence tracking**, **sparse spread** with TRIM=64, **event-driven STDP** via `FiredNodesBuffer [u32; 1024]`, **counterfactual short-circuit**), VerificationLoop, CognitiveDaemon (**set_cognitive_mode()**, **set_self_healing_hook()**, runs `SelfHealingHook` during idle consolidation), **WorkingMemoryWorkspace** (`[NodeId; 12]`, resonance +0.15), **RenderCommand/RenderPrediction feedback loop** (+**render_target: CognitiveMode**), Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), EventChannel, Consolidation (**synthesize_categories()** v2: edge-signature + **predictive-role abstraction** with 2-hop profile clustering) |
+| `cognitive-core` | ActivationEngine (6-phase tick: **precision-weighted prediction error**, **workspace resonance**, **epistemic gating**, **belief confidence tracking**, **sparse spread** with TRIM=64, **event-driven STDP** via `FiredNodesBuffer [u32; 1024]`, **counterfactual short-circuit**), VerificationLoop, CognitiveDaemon (**set_cognitive_mode()**, **set_self_healing_hook()**, **set_episodic_recorder()**, runs `SelfHealingHook` + `EpisodicRecorder` during idle consolidation), **WorkingMemoryWorkspace** (`[NodeId; 12]`, resonance +0.15), **RenderCommand/RenderPrediction feedback loop** (+**render_target: CognitiveMode**), Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), **EpisodicEvent** enum (5 variants for hot-path recording), **EpisodicRecorder** trait (lock-free record + consolidate), EventChannel, Consolidation (**synthesize_categories()** v2: edge-signature + **predictive-role abstraction** with 2-hop profile clustering) |
 | `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge, creates `ModuleRegistry` + `SelfHealingPipeline` with default constraints, attaches to daemon via `set_self_healing_hook()`, **RenderBridge** (OS thread, dual buffer + ring polling, RenderBackend trait, Null/Wgpu backends), **PenalizeFn** (–0.05 valence on validate_ast() error) |
 | `curiosity-core` | Gap detection, **CCG-based DefinitionResolver**, async harvester, **CuriosityBudget** (energy-aware, replaces depth 10) |
 | `metacognition` | **Self-healing pipeline**: `DeficiencyScanner` (constraint violation detection), `CandidateModule` DSL (18 safe opcodes, bytecode interpreter), `SwapSlot` lock-free double-buffer hot-swap, 5-phase `SelfHealingPipeline` (Generation → Contract Verification → Regression Testing → Ecological Benchmarking → Hot-Swap), `MetacognitiveCuriosity` (internal budget routing) |
+| `episodic-memory` | **Episodic timeline**: lock-free SPSC ring buffer (1024 × 64 bytes) for hot-path event recording, idle-cycle consolidation into `NodeType::Episode` graph nodes linked to SELF via `Relation::Experienced`, query API for tick-range / node-label / recent-N retrieval |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json, **effector math** (GravityVector, PaletteInterpolator, SkeletalTransformMatrix), **TransformEngine** (sensor→effector) |
 | `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
@@ -477,6 +512,7 @@ After every tick's valence update:
 - [x] **Counterfactual simulation mode**: `CognitiveMode::Counterfactual` short-circuits Phase 4 (STDP) and Phase 5 (valence), `RenderCommand.render_target` routes to ImaginationBuffer
 - [x] **Predictive-role abstraction**: two-pass category synthesis (edge-signature + 2-hop predictive profile clustering at 70% overlap, terminal node extraction)
 - [x] **Self-healing metacognition**: DeficiencyScanner + 5-phase pipeline + DSL bytecode (18 opcodes) + SwapSlot lock-free hot-swap + metacognitive curiosity divert
+- [x] **Unified episodic memory**: lock-free SPSC ring buffer (1024 × 64 bytes), 5 event types (firing/prediction-error/fault/sensor/intent), idle-cycle graph consolidation as `NodeType::Episode` nodes linked to SELF via `Relation::Experienced`, tick-range / node-label / recent-N query API
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
 
