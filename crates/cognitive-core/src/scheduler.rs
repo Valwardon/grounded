@@ -86,6 +86,29 @@ pub enum EpisodicEvent {
     },
 }
 
+/// Hook for metacognitive curiosity budget diversion.
+///
+/// During idle consolidation cycles, the cognitive daemon checks
+/// whether curiosity budget should be diverted from external gap
+/// resolution to internal self-healing. Implemented by
+/// metacognition::metacuriosity::MetacognitiveCuriosity.
+pub trait CuriosityHook: Send {
+    /// Should the curiosity budget be diverted to internal
+    /// self-healing instead of external exploration?
+    fn should_divert(&self) -> bool;
+
+    /// Fraction of remaining budget to allocate to internal
+    /// self-healing (0.0 = all external, 1.0 = all internal).
+    fn internal_fraction(&self) -> f64;
+
+    /// Called every tick to refresh deficiency scans and
+    /// update internal routing state.
+    fn tick(&mut self);
+
+    /// Human-readable summary of the current diversion state.
+    fn summary(&self) -> String;
+}
+
 /// Trait for the episodic memory system.
 ///
 /// Implemented by episodic_memory::history::EpisodicHistory.
@@ -219,6 +242,11 @@ pub struct CognitiveDaemon {
     /// record() called during the tick loop for lock-free event logging.
     /// consolidate() called during idle consolidation to promote episodes.
     episodic_recorder: parking_lot::Mutex<Option<Box<dyn EpisodicRecorder>>>,
+
+    /// Optional metacognitive curiosity hook for budget diversion.
+    /// When active, routes curiosity budget to internal self-healing
+    /// instead of external gap resolution.
+    curiosity_hook: parking_lot::Mutex<Option<Box<dyn CuriosityHook>>>,
 }
 
 impl CognitiveDaemon {
@@ -249,6 +277,7 @@ impl CognitiveDaemon {
             dmn_focus: std::sync::atomic::AtomicU64::new(NodeId::SELF.0),
             self_healing_hook: parking_lot::Mutex::new(None),
             episodic_recorder: parking_lot::Mutex::new(None),
+            curiosity_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -365,6 +394,13 @@ impl CognitiveDaemon {
     /// Records events during the tick loop and consolidates during idle cycles.
     pub fn set_episodic_recorder(&self, recorder: Box<dyn EpisodicRecorder>) {
         *self.episodic_recorder.lock() = Some(recorder);
+    }
+
+    /// Attach a metacognitive curiosity hook for budget diversion.
+    /// When active, routes curiosity budget to internal self-healing
+    /// instead of external gap resolution during idle cycles.
+    pub fn set_curiosity_hook(&self, hook: Box<dyn CuriosityHook>) {
+        *self.curiosity_hook.lock() = Some(hook);
     }
 
     /// Set the cognitive mode for the next tick.
@@ -572,6 +608,23 @@ impl CognitiveDaemon {
                             outputs.push(CognitiveOutput::LogMessage {
                                 level: 1,
                                 text: summary,
+                            });
+                        }
+                    }
+
+                    // ── Metacognitive curiosity budget diversion (if attached) ──
+                    // Check whether curiosity budget should be routed to internal
+                    // self-healing instead of external gap resolution. When deficiency
+                    // severity is high, the system prioritizes fixing its own modules
+                    // over exploring the external world.
+                    if let Some(ref mut hook) = *self.curiosity_hook.lock() {
+                        hook.tick();
+                        if hook.should_divert() {
+                            let summary = hook.summary();
+                            let mut outputs = self.output_channel.write();
+                            outputs.push(CognitiveOutput::LogMessage {
+                                level: 1,
+                                text: format!("Curiosity diverted: {}", summary),
                             });
                         }
                     }
@@ -874,7 +927,27 @@ impl CognitiveDaemon {
 
         // ── Curiosity drive: if very idle, seek novelty ──
         if idle_ticks > 200 && idle_ticks % 100 == 0 {
-            // Pick a node with very few edges (poorly understood)
+            // Check if curiosity budget is being diverted to internal self-healing
+            let diverted = {
+                if let Some(ref mut hook) = *self.curiosity_hook.lock() {
+                    hook.tick();
+                    hook.should_divert()
+                } else {
+                    false
+                }
+            };
+
+            if diverted {
+                // Budget is routed internally — skip external curiosity injection
+                let mut outputs = self.output_channel.write();
+                outputs.push(CognitiveOutput::LogMessage {
+                    level: 1,
+                    text: "Curiosity diverted: external exploration paused, routing energy to self-healing".into(),
+                });
+                return;
+            }
+
+            // Normal curiosity: pick a node with very few edges (poorly understood)
             let mut candidates: Vec<(NodeId, usize)> = Vec::new();
             let node_count = graph.len();
             for i in 2..node_count {

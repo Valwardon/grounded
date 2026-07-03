@@ -29,6 +29,7 @@
 // ────────────────────────────────────────────────────────────
 
 use std::time::Duration;
+use cognitive_core::CuriosityHook;
 use semantic_graph::prelude::*;
 use curiosity_core::gap::CuriosityBudget;
 
@@ -237,10 +238,10 @@ impl MetacognitiveCuriosity {
         self.allocator.bind(pipeline);
     }
 
-    /// Call every cognitive tick.
+    /// Advance one tick of the metacognitive cycle.
     /// Returns true if the budget should be routed to the self-healing
-    /// pipeline this tick.
-    pub fn tick(&mut self) -> bool {
+    /// pipeline this tick (internal optimization active).
+    pub fn advance(&mut self) -> bool {
         self.ticks_since_scan += 1;
 
         if self.ticks_since_scan >= self.scan_interval_ticks {
@@ -248,7 +249,6 @@ impl MetacognitiveCuriosity {
             self.ticks_since_scan = 0;
 
             if self.allocator.should_route_internal() {
-                // Activate internal optimization mode
                 self.internal_optimization_active = true;
                 return true;
             }
@@ -290,5 +290,37 @@ impl MetacognitiveCuriosity {
         } else {
             false
         }
+    }
+}
+
+// ── CuriosityHook implementation ─────────────────────────
+
+impl CuriosityHook for MetacognitiveCuriosity {
+    fn should_divert(&self) -> bool {
+        self.internal_optimization_active
+    }
+
+    fn internal_fraction(&self) -> f64 {
+        let (int_frac, _) = self.allocator.allocation_split();
+        int_frac
+    }
+
+    /// Called by the cognitive daemon during idle consolidation.
+    /// Delegates to the inherent advance() method which handles the
+    /// scan interval timing, deficiency refresh, and state transitions.
+    fn tick(&mut self) {
+        self.advance();
+    }
+
+    fn summary(&self) -> String {
+        let (int_frac, ext_frac) = self.allocation();
+        let severity = self.allocator.last_deficiency_severity;
+        format!(
+            "deficiency_severity={:.2}, internal={:.1}%, external={:.1}%, remaining={:.2}",
+            severity,
+            int_frac * 100.0,
+            ext_frac * 100.0,
+            self.budget.remaining,
+        )
     }
 }

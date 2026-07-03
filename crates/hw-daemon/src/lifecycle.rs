@@ -2,9 +2,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use std::time::Duration;
-use cognitive_core::{CognitiveDaemon, EpisodicRecorder, SelfHealingHook};
+use cognitive_core::{CognitiveDaemon, CuriosityHook, EpisodicRecorder, SelfHealingHook};
 use episodic_memory::EpisodicHistory;
-use metacognition::{SelfHealingPipeline, ModuleRegistry, Constraint};
+use metacognition::{SelfHealingPipeline, ModuleRegistry, Constraint, MetacognitiveCuriosity};
 use semantic_graph::prelude::*;
 use crate::render_bridge::{RenderBridge, NullRenderBackend};
 
@@ -104,8 +104,21 @@ impl CognitiveLifecycle {
                 .with_max_violations(5),
         );
 
-        // Attach the pipeline to the daemon's idle consolidation pass
-        daemon.set_self_healing_hook(Box::new(pipeline));
+        // Box the pipeline FIRST (heap-allocates it) so that the raw pointer
+        // stored by MetacognitiveCuriosity::bind() points to a stable address.
+        let pipeline_box = Box::new(pipeline);
+
+        // ── Initialize the metacognitive curiosity divert ──
+        // Must bind to the pipeline BEFORE the Box is moved into the daemon,
+        // but after boxing so the raw pointer targets the heap address.
+        let mut metacuriosity = MetacognitiveCuriosity::new(10.0);
+        metacuriosity.bind(&pipeline_box);
+        daemon.set_curiosity_hook(Box::new(metacuriosity));
+
+        // Attach the pipeline to the daemon's idle consolidation pass.
+        // The Box move only moves the pointer, not the pointee, so the
+        // raw pointer in MetacognitiveBudgetAllocator remains valid.
+        daemon.set_self_healing_hook(pipeline_box);
 
         // ── Initialize the episodic memory system ──
         // Records events during the tick loop and consolidates important

@@ -694,6 +694,22 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - `Grounding::Episode { tick, timestamp_ms, importance }` — structured metadata on episode nodes.
 - `Grounding::Episode` variant added to `Grounding` enum.
 
+### cognitive-core curiosity hook wiring (this session)
+- `CuriosityHook` trait (`scheduler.rs:95-110`) — 4 methods: `should_divert()`, `internal_fraction()`, `tick()`, `summary()`. Follows same pattern as `SelfHealingHook` and `EpisodicRecorder`.
+- `CognitiveDaemon::curiosity_hook` — `parking_lot::Mutex<Option<Box<dyn CuriosityHook>>>` field. `set_curiosity_hook()` setter.
+- Idle consolidation wiring: after episodic recorder consolidate (line ~590), calls `hook.tick()` and logs `"Curiosity diverted: …"` when `should_divert()` is true.
+- DMN curiosity drive wiring (line ~890): before scanning for under-explored nodes, checks hook. If diverted, skips external curiosity injection and returns early (log: `"Curiosity diverted: external exploration paused, routing energy to self-healing"`).
+
+### metacognition metacuriosity hook impl (this session)
+- `MetacognitiveCuriosity` now implements `CuriosityHook`.
+- `tick()` — delegates to `advance()` (renamed from inherent `tick()` to avoid trait collision).
+- `should_divert()` — returns `self.internal_optimization_active` (set when deficiency severity > 0.3).
+- `internal_fraction()` — delegates to `allocator.allocation_split()`.
+- `summary()` — reports deficiency_severity, internal/external split %, remaining budget.
+
+### hw-daemon lifecycle wiring (this session)
+- `lifecycle.rs:111-121` — pipeline is Boxed FIRST (heap-stable address), then metacuriosity is created + bound to the boxed pipeline via raw pointer, then hook attached to daemon, then pipeline_box moved into daemon's `SelfHealingHook`. This ordering ensures the raw pointer in `MetacognitiveBudgetAllocator` targets the heap address (stable after Box move).
+
 ## Critical Rules for Agent
 
 1. NEVER add randomness, probability, or ML. Every decision is deterministic graph math, CCG reduction, or table lookup.

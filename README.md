@@ -511,7 +511,7 @@ After every tick's valence update:
 - [x] **Working memory workspace**: `[NodeId; 12]` stack-allocated attention buffer, `+0.15` resonance injection, `TransientWorkspace` contract edges (skipped in STDP and consolidation)
 - [x] **Counterfactual simulation mode**: `CognitiveMode::Counterfactual` short-circuits Phase 4 (STDP) and Phase 5 (valence), `RenderCommand.render_target` routes to ImaginationBuffer
 - [x] **Predictive-role abstraction**: two-pass category synthesis (edge-signature + 2-hop predictive profile clustering at 70% overlap, terminal node extraction)
-- [x] **Self-healing metacognition**: DeficiencyScanner + 5-phase pipeline + DSL bytecode (18 opcodes) + SwapSlot lock-free hot-swap + metacognitive curiosity divert
+- [x] **Self-healing metacognition**: DeficiencyScanner + 5-phase pipeline + DSL bytecode (18 opcodes) + SwapSlot lock-free hot-swap + metacognitive curiosity divert (wired end-to-end via `CuriosityHook` trait in cognitive-core, implemented by `MetacognitiveCuriosity`, called in idle consolidation and DMN curiosity drive)
 - [x] **Unified episodic memory**: lock-free SPSC ring buffer (1024 × 64 bytes), 5 event types (firing/prediction-error/fault/sensor/intent), idle-cycle graph consolidation as `NodeType::Episode` nodes linked to SELF via `Relation::Experienced`, tick-range / node-label / recent-N query API
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
