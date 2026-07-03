@@ -24,15 +24,65 @@ This is not machine learning. This is *structure building*.
 ### Spreading Activation
 
 ```
-For each node, every 16ms tick:
-  1. Decay:   activation *= node.decay * 0.97
-  2. Inject:  activation += energy from sensors/intents
-  3. Fire:    if activation > threshold → emit action JSON, reset to 0
-  4. Spread:  for each edge, send energy to neighbor
-              (conservation: sender loses what receiver gains)
+For each node, every 16ms tick (4-phase):
+  Phase 1 — Neuromodulator decay:
+    novelty/arousal/reward leak toward baseline.
+    Compute global threshold_mod, plasticity_mod.
+
+  Phase 2 — Decay + Injection + Prediction Error:
+    activation *= node.decay * 0.97
+    activation += sensor/intent energy
+    |activation - prediction| > 30% → PredictionError → novelty spike
+
+  Phase 3 — Spread + Eligibility:
+    if activation > threshold * threshold_mod → fire, reset to 0
+    else: for each edge, spread energy to neighbor (conservation)
+          compute next-tick prediction from resulting activation
+
+  Phase 4 — STDP + pruning:
+    for each edge: decay eligibility, boost if source fired,
+    if target fired: LTP = eligibility * rate * plasticity_mod,
+    drift toward default weight, prune if |weight| < 0.005
 ```
 
 No allocations in the hot path. Double-buffered activation arrays flipped atomically. Zero-lock reads.
+
+### Neuromodulation
+
+Three global channels modulate behavior like brain chemistry:
+
+| Channel | Spiked by | Effect |
+|---------|-----------|--------|
+| **Novelty** | Curiosity gaps, prediction errors | Lowers thresholds (easier to fire), accelerates STDP |
+| **Arousal** | Rapid sensor deltas (>0.5g) | Lowers thresholds, clamps curiosity loops |
+| **Reward** | Stable predictions over time | Solidifies recent edge changes |
+
+Each decays naturally toward baseline every tick (novelty 8%, arousal 12%, reward 4%).
+
+### Predictive Coding
+
+Every activation tick computes a forward prediction: "what activation level do I expect next tick?" When sensor data violates this expectation, a Prediction Error signal is generated — injecting energetic novelty into the curiosity loop:
+
+```
+tick N: spread activation → compute prediction[node] = activation[node]
+tick N+1: compare actual vs prediction
+           error = |actual - expected| / expected
+           if error > 0.3 → spike novelty, inject into curiosity gap node
+```
+
+### Spike-Timing-Dependent Plasticity (STDP)
+
+Edges learn from co-firing patterns. Each Edge carries:
+- `dynamic_weight` — the effective weight used during spreading, modified by STDP
+- `eligibility` — a Hebbian trace that decays (×0.9/tick), boosts (+1.0) when source fires, and is consumed (×0.5) when target fires to drive Long-Term Potentiation
+
+Between LTP events, `dynamic_weight` slowly drifts toward the architecturally-intended default weight (LTD drift). Edges below `|0.005|` are pruned during consolidation.
+
+### Sleep Consolidation
+
+When neuromodulator levels are low (novelty < 0.1, arousal < 0.1) and 1000 ticks have elapsed (~16s), the engine runs an offline consolidation pass:
+- **Edge GC** — removes pruned edges
+- **Linear chain compression** — A→B→C where B is a pass-through node (indegree=1, outdegree=1) becomes direct edge A→C with combined weight
 
 ### The Self Node
 
@@ -114,13 +164,13 @@ The same compound prompt feeds into the asset ingestor:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode, GraphArena, ActivationBuffer, ConceptualFrame, 10 Relation types |
+| `semantic-graph` | GroundedNode, GraphArena, ActivationBuffer, Edge (STDP), FiringHistory, Neuromodulator, PredictionError, ConceptualFrame, 10 Relation types |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer (JSON/text) |
-| `cognitive-core` | Spreading activation engine, EventChannel, 16ms daemon loop |
-| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive |
+| `cognitive-core` | ActivationEngine (4-phase tick), EventChannel, CognitiveDaemon, Consolidation |
+| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge |
 | `curiosity-core` | Gap detection, offline knowledge resolution, async harvester |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, render ops |
-| `uniffi-exports` | 12-function UniFFI surface for Kotlin |
+| `uniffi-exports` | 15-function UniFFI surface for Kotlin |
 
 ## Status
 
@@ -129,6 +179,11 @@ The same compound prompt feeds into the asset ingestor:
 - [x] Semantic graph with arena allocation + double-buffered activation
 - [x] 4-phase spreading activation (decay/inject/spread/fire)
 - [x] 30+ verb→CD action mappings
+- [x] 4-phase tick: neuromodulator decay → prediction error → spread + eligibility → STDP + pruning
+- [x] Hebbian STDP: dynamic_edge_weight, eligibility traces, LTP on co-firing, LTD drift, pruning
+- [x] Neuromodulation: novelty, arousal, reward channels with per-tick decay and global threshold/plasticity modulation
+- [x] Predictive coding: activation predictions, |error| > 30% novelty spike
+- [x] Sleep consolidation: edge GC, linear chain compression
 - [x] Lock-free SPSC event channel (128 slots)
 - [x] Self node: `NodeId::SELF` (index 1) pre-inserted in every graph with base activation 1.0, decay 1.0 (never decays)
 - [x] Self-linking: every sensor reading, intent, and fired action anchors to SELF via `link_to_self()` — SELF never dies

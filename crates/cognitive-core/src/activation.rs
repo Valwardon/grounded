@@ -1,38 +1,36 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use semantic_graph::prelude::*;
 
 // ────────────────────────────────────────────────────────────
-//  Spreading activation engine
+//  Spreading activation engine — STDP + neuromodulation edition
 //
-//  This is the core "inference" mechanism. It is:
-//   - Deterministic: same input → same output, always.
-//   - Not probabilistic: no random samples, no temperature.
-//   - Grounded: energy flows between nodes along explicit edges.
+//  This is the core "inference" mechanism. Every tick (~16ms):
 //
-//  Algorithm per tick:
+//    Phase 1 — Neuromodulator decay:
+//      novelty, arousal, reward leak toward baseline.
+//      Compute global threshold_mod and plasticity_mod.
 //
-//    For each node i:
-//      a) Decay:      activation[i] *= node.decay
-//      b) Inject:     activation[i] += injected_energy[i] (from external events)
-//      c) Diffuse:    for each edge (i → j):
-//                        delta = activation[i] * edge.weight() * SPREAD_RATE
-//                        activation[j] += delta
-//                        activation[i] -= delta   (conservation, optional)
-//      d) Threshold:  if activation[i] > node.threshold:
-//                        fire_action(node)
-//                        activation[i] = 0.0
+//    Phase 2 — Decay + Injection + Prediction Error:
+//      For each node: a *= node.decay * DECAY_GLOBAL; a += injection.
+//      Compare a against prediction from last tick → prediction error → novelty spike.
 //
-//  Constants (deterministic, tuned for 16ms tick):
-//      SPREAD_RATE = 0.15   (15% of node's energy propagates per tick)
-//      BASE_INJECT = 0.4    (default energy for external event injection)
+//    Phase 3 — Spreading activation + eligibility:
+//      For each non-fired node, propagate energy along edges.
+//      Track eligibility: boosted when source fires, decays each tick.
+//      Compute next-tick prediction from resulting activations.
+//
+//    Phase 4 — STDP + pruning:
+//      For each edge: drift toward default, LTP on co-firing, prune if too weak.
+//
+//  Deterministic: same graph + same event sequence → same activations.
+//  Zero allocations in hot path: all buffers pre-sized at init.
 // ────────────────────────────────────────────────────────────
 
 pub const SPREAD_RATE: f64 = 0.15;
-pub const DECAY_GLOBAL: f64 = 0.97;       // global multiplier applied after node.decay
+pub const DECAY_GLOBAL: f64 = 0.97;
 pub const BASE_INJECT: f64 = 0.4;
-pub const ACTIVATION_MIN: f64 = 0.001;     // floor to prevent floating-point noise accumulation
+pub const ACTIVATION_MIN: f64 = 0.001;
 
 /// Result when a node crosses its threshold.
 #[derive(Debug, Clone)]
@@ -43,30 +41,47 @@ pub struct FiredAction {
     pub grounding: Grounding,
 }
 
-/// The activation engine. Owns references to the graph arena and the
-/// double-buffered activation array.
+/// The activation engine.
 pub struct ActivationEngine {
-    /// Shared graph reference
     ctx: Arc<SemanticContext>,
-    /// Accumulated injected energy from external events since last tick.
-    /// Indexed by NodeId.0.
     injection_queue: Vec<f64>,
-    /// Nodes that fired this tick.
     pub fired: Vec<FiredAction>,
+
+    // ── Neuromodulation ──
+    pub modulators: Neuromodulator,
+
+    // ── STDP history ──
+    pub firing_history: FiringHistory,
+
+    // ── Predictive coding ──
+    /// Predicted activation for each node (computed during Phase 3 of previous tick).
+    predictions: Vec<f64>,
+
+    /// Prediction errors detected this tick (consumed by daemon after tick).
+    pub prediction_errors: Vec<PredictionError>,
+
+    // ── Staging arrays (pre-allocated, zero alloc in hot path) ──
+    /// Which nodes fired this tick (bitset, parallel to firing_history words)
+    fired_this_tick: Vec<u64>,
 }
 
 impl ActivationEngine {
     pub fn new(ctx: Arc<SemanticContext>) -> Self {
-        let len = ctx.graph.read().len();
+        let len = ctx.graph.read().len().max(64);
+        let words = (len + 63) / 64;
         ActivationEngine {
-            ctx,
-            injection_queue: vec![0.0; len.max(64)],
+            injection_queue: vec![0.0; len],
             fired: Vec::with_capacity(16),
+            modulators: Neuromodulator::new(),
+            firing_history: FiringHistory::new(len),
+            predictions: vec![0.0; len],
+            prediction_errors: Vec::with_capacity(4),
+            fired_this_tick: vec![0; words.max(1)],
+            ctx,
         }
     }
 
-    /// Inject activation energy into a specific node. Called by external
-    /// event handlers (parser, sensor bridge, timer) — not by the spread loop.
+    /// Inject activation energy into a specific node.
     pub fn inject(&mut self, target: NodeId, energy: f64) {
         let idx = target.0 as usize;
         if idx < self.injection_queue.len() {
@@ -81,40 +96,38 @@ impl ActivationEngine {
         }
     }
 
-    // ── Single tick of the spreading activation algorithm ────
-    //
-    //  Allocates zero new memory in the hot path — works on pre-allocated
-    //  buffers inside the ActivationBuffer double buffer.
-    //
-    //  Returns: Vec<FiredAction> — list of nodes that crossed threshold
-    //           this tick.
+    /// Spike a neuromodulator channel (called from daemon).
+    pub fn spike_novelty(&mut self, amount: f64) { self.modulators.spike_novelty(amount); }
+    pub fn spike_arousal(&mut self, amount: f64) { self.modulators.spike_arousal(amount); }
+    pub fn spike_reward(&mut self, amount: f64) { self.modulators.spike_reward(amount); }
+
+    // ── Full 4-phase tick ──────────────────────────────────
 
     pub fn tick(&mut self) -> &[FiredAction] {
         self.fired.clear();
-        self.ctx.tick.fetch_add(1, Ordering::Relaxed);
+        self.prediction_errors.clear();
+        self.ctx.tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         let graph = self.ctx.graph.read();
         let node_count = graph.len();
 
-        // Ensure buffers are large enough
+        // Ensure buffers are large enough (cold path if resized)
         if self.injection_queue.len() < node_count {
             self.injection_queue.resize(node_count, 0.0);
+            self.predictions.resize(node_count, 0.0);
+            self.firing_history.resize(node_count);
+            let new_words = (node_count + 63) / 64;
+            self.fired_this_tick.resize(new_words.max(1), 0);
         }
 
-        // Acquire write access to the activation double buffer.
-        // We write into `back_mut()`, then flip at the end.
         let mut act_guard = self.ctx.activation.write();
         let activations = act_guard.back_mut();
 
-        // Ensure activations buffer is sized correctly
         if activations.len() < node_count {
-            // This path is cold — only hits on graph resize
             drop(act_guard);
             drop(graph);
-            // Re-acquire after potential resize
             let mut act_guard2 = self.ctx.activation.write();
             let activations2 = act_guard2.back_mut();
-            // Pad with zeros if needed
             for i in activations2.len()..node_count {
                 if i < activations2.len() {
                     activations2[i] = 0.0;
@@ -123,20 +136,26 @@ impl ActivationEngine {
             return &self.fired;
         }
 
-        // ── Phase 1: Decay + Injection ─────────────────────
+        // ──────────────────────────────────────────────────
+        //  Phase 1 — Neuromodulator decay
+        // ──────────────────────────────────────────────────
+        self.modulators.tick_decay();
+        let threshold_mod = self.modulators.threshold_modifier();
+        let plasticity_mod = self.modulators.plasticity_modifier();
+
+        // ──────────────────────────────────────────────────
+        //  Phase 2 — Decay + Injection + Prediction Error
+        // ──────────────────────────────────────────────────
         for i in 1..node_count {
-            let node = graph.get(NodeId::from_raw(i as u64));
-            let node = match node {
+            let node = match graph.get(NodeId::from_raw(i as u64)) {
                 Some(n) => n.read(),
                 None => continue,
             };
 
             let mut a = activations[i];
 
-            // Apply node-specific decay
-            a *= node.decay;
-            // Apply global decay floor
-            a *= DECAY_GLOBAL;
+            // Node-specific decay followed by global decay
+            a *= node.decay * DECAY_GLOBAL;
 
             // Add injected energy from external events
             a += self.injection_queue[i];
@@ -146,17 +165,31 @@ impl ActivationEngine {
                 a = 0.0;
             }
 
+            // ── Prediction error check ──
+            let predicted = self.predictions[i];
+            if predicted > ACTIVATION_MIN {
+                let error = (a - predicted).abs() / predicted.max(ACTIVATION_MIN);
+                if error > PREDICTION_ERROR_THRESHOLD {
+                    self.prediction_errors.push(PredictionError {
+                        node_id: NodeId::from_raw(i as u64),
+                        expected: predicted,
+                        actual: a,
+                        error_magnitude: error,
+                    });
+                    // Spike novelty proportional to prediction error
+                    self.modulators.spike_novelty(error * 0.15);
+                }
+            }
+
             activations[i] = a;
         }
 
-        // ── Phase 2: Spreading activation along edges ───────
+        // ──────────────────────────────────────────────────
+        //  Phase 3 — Spreading activation + eligibility
+        // ──────────────────────────────────────────────────
         //
-        //  For each node with activation > threshold, fire.
-        //  For each edge, propagate energy to target.
-        //
-        //  NOTE: This is an O(E) pass. E is bounded by graph size at init time.
-        //  For large graphs (>10K nodes), partition into subgraphs and process
-        //  in chunks across ticks.
+        //  Clear fired_this_tick bitset for the current tick
+        self.clear_fired_bitset();
 
         for i in 1..node_count {
             let a_i = activations[i];
@@ -164,22 +197,31 @@ impl ActivationEngine {
                 continue;
             }
 
-            let node = graph.get(NodeId::from_raw(i as u64));
-            let node = match node {
+            let node = match graph.get(NodeId::from_raw(i as u64)) {
                 Some(n) => n.read(),
                 None => continue,
             };
 
-            // ── Threshold check ──
-            if a_i > node.threshold {
+            // ── Threshold check (modulated by neuromodulators) ──
+            let effective_threshold = node.threshold * threshold_mod;
+            if a_i > effective_threshold {
+                // Node fires this tick
                 self.fired.push(FiredAction {
                     node_id: NodeId::from_raw(i as u64),
                     node_label: node.label.clone(),
                     activation_level: a_i,
                     grounding: node.grounding.clone(),
                 });
-                activations[i] = 0.0; // consume all energy on fire
-                continue; // don't spread from a just-fired node
+
+                // Record in bitset
+                self.set_fired_bit(i);
+
+                // Record in ring buffer
+                self.firing_history.record_fired(NodeId::from_raw(i as u64));
+
+                // Consume all energy on fire (no spread from fired node)
+                activations[i] = 0.0;
+                continue;
             }
 
             // ── Spread to neighbors ──
@@ -190,32 +232,125 @@ impl ActivationEngine {
                 }
                 let spread_energy = a_i * edge.effective_weight() * SPREAD_RATE;
                 activations[target_idx] += spread_energy;
-                // Conservation: subtract what we gave
-                activations[i] -= spread_energy;
+                activations[i] -= spread_energy; // conservation
             }
         }
+
+        // ── Compute next-tick predictions from current activation levels ──
+        // Prediction = what activation we expect next tick (after decay + injection)
+        for i in 1..node_count {
+            self.predictions[i] = activations[i];
+        }
+
+        // ──────────────────────────────────────────────────
+        //  Phase 4 — STDP + pruning
+        // ──────────────────────────────────────────────────
+        //
+        //  Iterate all edges (O(E)). For each:
+        //    1. Eligibility decay
+        //    2. Eligibility boost if source fired this tick
+        //    3. LTP if target fired this tick → consume eligibility
+        //    4. LTD drift toward default weight
+        //    5. Mark for pruning if |dynamic_weight| < PRUNE_THRESHOLD
+
+        let mut prune_targets: Vec<(usize, usize)> = Vec::with_capacity(16);
+
+        for i in 1..node_count {
+            let node = match graph.get(NodeId::from_raw(i as u64)) {
+                Some(n) => n.write(),
+                None => continue,
+            };
+
+            for (edge_idx, edge) in node.edges.iter_mut().enumerate() {
+                // Eligibility decay
+                edge.eligibility *= ELIGIBILITY_DECAY;
+
+                // Boost if source (i) fired this tick
+                if self.is_fired_this_tick(i) {
+                    edge.eligibility += 1.0;
+                }
+
+                // LTP: if target fired this tick, consume eligibility
+                let target_idx = edge.target.0 as usize;
+                if target_idx < node_count && self.is_fired_this_tick(target_idx) {
+                    let delta = edge.eligibility * LTP_RATE * plasticity_mod;
+                    edge.dynamic_weight = (edge.dynamic_weight + delta).clamp(-1.0, 1.0);
+                    edge.eligibility *= 0.5; // consumed
+                }
+
+                // LTD drift toward default weight
+                let default_w = edge.weight_override.unwrap_or_else(|| edge.relation.spread_weight());
+                edge.dynamic_weight += (default_w - edge.dynamic_weight) * DRIFT_RATE;
+                edge.dynamic_weight = edge.dynamic_weight.clamp(-1.0, 1.0);
+
+                // Mark for pruning if weight fell below threshold
+                if edge.dynamic_weight.abs() < PRUNE_THRESHOLD {
+                    prune_targets.push((i, edge_idx));
+                    edge.dynamic_weight = 0.0;
+                }
+            }
+        }
+
+        // Prune edges with |weight| < threshold (set weight to 0, will be GC'd later)
+        // We mark them by zeroing dynamic_weight so they become effectively disconnected
+        for (node_idx, edge_idx) in &prune_targets {
+            if let Some(node_lock) = graph.get(NodeId::from_raw(*node_idx as u64)) {
+                let mut node = node_lock.write();
+                if *edge_idx < node.edges.len() {
+                    node.edges[*edge_idx].dynamic_weight = 0.0;
+                }
+            }
+        }
+
+        // ── Advance firing history ring buffer ──
+        self.firing_history.advance_tick();
 
         // ── Zero out injection queue for next tick ──
         for i in 1..node_count {
             self.injection_queue[i] = 0.0;
         }
 
-        // ── Flip the double buffer — readers now see this tick's state ──
+        // ── Flip double buffer ──
         act_guard.flip();
 
         &self.fired
+    }
+
+    // ── Bitset helpers ──────────────────────────────────
+
+    #[inline]
+    fn set_fired_bit(&mut self, node_idx: usize) {
+        let word = node_idx / 64;
+        let bit = node_idx % 64;
+        if word < self.fired_this_tick.len() {
+            self.fired_this_tick[word] |= 1u64 << bit;
+        }
+    }
+
+    #[inline]
+    fn is_fired_this_tick(&self, node_idx: usize) -> bool {
+        let word = node_idx / 64;
+        let bit = node_idx % 64;
+        word < self.fired_this_tick.len() && (self.fired_this_tick[word] & (1u64 << bit)) != 0
+    }
+
+    #[inline]
+    fn clear_fired_bitset(&mut self) {
+        for w in &mut self.fired_this_tick {
+            *w = 0;
+        }
     }
 
     /// Get the current activation levels (for monitoring / debug UI).
     pub fn read_activations(&self) -> Vec<(NodeId, f64)> {
         let act = self.ctx.activation.read();
         let snapshot = act.read();
-        snapshot
-            .iter()
-            .enumerate()
-            .skip(1)
-            .map(|(i, &v)| (NodeId::from_raw(i as u64), v))
-            .collect()
+        snapshot.iter().enumerate().skip(1).map(|(i, &v)| (NodeId::from_raw(i as u64), v)).collect()
+    }
+
+    /// Current neuromodulator levels (for debug/bridge).
+    pub fn read_modulators(&self) -> (f64, f64, f64) {
+        (self.modulators.novelty, self.modulators.arousal, self.modulators.reward)
     }
 }
 
@@ -238,13 +373,7 @@ mod tests {
             decay: 0.8,
             threshold: 2.0,
             base_activation: 0.0,
-            edges: vec![
-                Edge {
-                    relation: Relation::Activates,
-                    target: NodeId::from_raw(2),
-                    weight_override: None,
-                },
-            ],
+            edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(2))],
         });
 
         g.insert(GroundedNode {
@@ -255,13 +384,7 @@ mod tests {
             decay: 0.9,
             threshold: 1.5,
             base_activation: 0.0,
-            edges: vec![
-                Edge {
-                    relation: Relation::Implies,
-                    target: NodeId::from_raw(3),
-                    weight_override: None,
-                },
-            ],
+            edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
         });
 
         g.insert(GroundedNode {
@@ -286,10 +409,8 @@ mod tests {
         let ctx = SemanticContext::new(graph);
         let mut engine = ActivationEngine::new(ctx.clone());
 
-        // Inject energy into sensor_motion node (id=1)
         engine.inject(NodeId::from_raw(1), 2.5);
 
-        // Run ticks until something fires or we hit limit
         for _ in 0..10 {
             let fired = engine.tick();
             if !fired.is_empty() {
@@ -297,7 +418,6 @@ mod tests {
                 return;
             }
         }
-
         panic!("No action fired within 10 ticks");
     }
 
@@ -313,21 +433,13 @@ mod tests {
         for _ in 0..30 {
             let _fired = engine.tick();
             let activations = engine.read_activations();
-            let max = activations
-                .iter()
-                .map(|(_, v)| *v)
-                .fold(0.0_f64, f64::max);
+            let max = activations.iter().map(|(_, v)| *v).fold(0.0_f64, f64::max);
             max_seen = max_seen.max(max);
-
             if max < ACTIVATION_MIN {
-                return; // decayed to zero — success
+                return;
             }
         }
-
-        panic!(
-            "Energy did not decay to zero within 30 ticks (last max: {:.6})",
-            max_seen
-        );
+        panic!("Energy did not decay to zero within 30 ticks (last max: {:.6})", max_seen);
     }
 
     #[test]
@@ -340,5 +452,110 @@ mod tests {
         let activations = engine.read_activations();
         assert!(!activations.is_empty(), "should have activation readings");
         assert_eq!(activations[0].0, NodeId::from_raw(1));
+    }
+
+    #[test]
+    fn stdp_strengthens_cofiring_edge() {
+        let mut graph = GraphArena::with_capacity(16);
+        // Node 2 and 3 where 2→3 has an edge
+        let mut n2 = GroundedNode {
+            id: NodeId::ZERO,
+            label: "trigger".into(),
+            node_type: NodeType::Concept,
+            grounding: Grounding::Abstract,
+            decay: 0.9,
+            threshold: 0.5,
+            base_activation: 0.0,
+            edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(3))],
+        };
+        let n3 = GroundedNode {
+            id: NodeId::ZERO,
+            label: "target".into(),
+            node_type: NodeType::Concept,
+            grounding: Grounding::Abstract,
+            decay: 0.9,
+            threshold: 1.5,
+            base_activation: 0.0,
+            edges: Vec::new(),
+        };
+        graph.insert(n2);
+        graph.insert(n3);
+
+        let ctx = SemanticContext::new(graph);
+        let mut engine = ActivationEngine::new(ctx.clone());
+
+        let initial_weight = engine.ctx.graph.read()
+            .get(NodeId::from_raw(2)).unwrap().read()
+            .edges[0].dynamic_weight;
+
+        // Inject so both fire: trigger gets 2.0, target gets 2.0
+        engine.inject(NodeId::from_raw(2), 2.0);
+        engine.inject(NodeId::from_raw(3), 2.0);
+
+        for _ in 0..3 {
+            engine.tick();
+        }
+
+        let post_weight = engine.ctx.graph.read()
+            .get(NodeId::from_raw(2)).unwrap().read()
+            .edges[0].dynamic_weight;
+
+        // Edge should be reinforced from co-firing
+        assert!(post_weight > initial_weight,
+            "STDP should strengthen co-firing edge: {:.6} -> {:.6}", initial_weight, post_weight);
+    }
+
+    #[test]
+    fn prediction_error_spikes_novelty() {
+        let graph = test_graph();
+        let ctx = SemanticContext::new(graph);
+        let mut engine = ActivationEngine::new(ctx.clone());
+
+        // First tick establishes a prediction baseline
+        engine.inject(NodeId::from_raw(1), 2.5);
+        engine.tick();
+
+        let novelty_before = engine.modulators.novelty;
+
+        // Second tick with zero injection → prediction will be wrong (expects energy, gets none)
+        engine.inject(NodeId::from_raw(1), 0.0);
+        engine.tick();
+
+        let novelty_after = engine.modulators.novelty;
+        assert!(novelty_after > novelty_before,
+            "Prediction error should increase novelty: {:.6} -> {:.6}", novelty_before, novelty_after);
+    }
+
+    #[test]
+    fn neuromodulator_threshold_modulation() {
+        let mut graph = GraphArena::with_capacity(16);
+        let node = GroundedNode {
+            id: NodeId::ZERO,
+            label: "hard_to_fire".into(),
+            node_type: NodeType::Concept,
+            grounding: Grounding::Abstract,
+            decay: 0.9,
+            threshold: 5.0,  // high threshold
+            base_activation: 0.0,
+            edges: Vec::new(),
+        };
+        graph.insert(node);
+        let ctx = SemanticContext::new(graph);
+        let mut engine = ActivationEngine::new(ctx.clone());
+
+        // Inject below threshold (4.0 < 5.0), should not fire without neuromodulation
+        engine.inject(NodeId::from_raw(2), 4.0);
+        let fired = engine.tick();
+        assert!(fired.is_empty(), "Should not fire without modulation");
+
+        // Now spike novelty to lower effective threshold
+        engine.spike_novelty(1.0);
+        engine.inject(NodeId::from_raw(2), 4.0);
+        let fired2 = engine.tick();
+
+        // With novelty=1.0, threshold_mod = 1.0 - 0.35 = 0.65
+        // effective_threshold = 5.0 * 0.65 = 3.25
+        // 4.0 > 3.25 → should fire
+        assert!(!fired2.is_empty(), "Should fire with high novelty modulation");
     }
 }

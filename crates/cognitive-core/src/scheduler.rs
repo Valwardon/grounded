@@ -14,45 +14,33 @@ use crate::activation::*;
 //  Runs on its own OS thread (not on the Tokio runtime).
 //  Tick rate: 16ms (≈60Hz), matching the UI frame budget.
 //
-//  Architecture:
+//  Architecture (extended with neuromodulation + STDP + prediction):
 //
 //    loop {
-//        let start = Instant::now();
-//
-//        1. Drain external event queue (sensor frames, intents, timers)
-//           → inject activation into graph nodes
-//
-//        2. Run one tick of spreading activation
-//           → collect FiredActions
-//
-//        3. For each FiredAction:
-//           a) If Grounding::Action: realize CD frame → JSON → push to output channel
-//           b) If Grounding::Sensor: update graph state node
-//           c) If Grounding::Stored: persist value
-//
-//        4. Check for lifecycle signals (shutdown, pause, config reload)
-//
-//        5. Sleep remaining of 16ms slot
+//        1. Drain external events → inject activation + handle modulation
+//        2. Run one 4-phase tick (decay/inject/spread/fire + STDP)
+//        3. Process prediction errors → spike novelty
+//        4. Dispatch fired actions → output channel
+//        5. Optional: trigger consolidation if idle
+//        6. Sleep remaining of 16ms slot
 //    }
-//
-//  No Tokio, no async. Pure deterministic sync loop.
 // ────────────────────────────────────────────────────────────
 
-/// Event sources that feed into the cognitive loop.
-/// These are pushed from Kotlin via the lock-free channel.
 #[derive(Debug, Clone)]
 pub enum CognitiveEvent {
     Intent { source: String, json: String, timestamp_ms: u64 },
     SensorReading { sensor: String, channel: u8, value: f32, timestamp_ms: u64 },
     TimerElapsed { timer_id: u64 },
     GraphCommand { json: String },
+    /// Spike a neuromodulator channel from external source (e.g., curiosity harvester)
+    Modulate { channel: String, amount: f64 },
+    /// Trigger offline consolidation pass
+    Consolidate,
     Shutdown,
     Pause,
     Resume,
 }
 
-/// Output actions produced by the cognitive loop.
-/// These flow back to Kotlin for execution (intents, notifications, UI updates).
 #[derive(Debug, Clone)]
 pub enum CognitiveOutput {
     AndroidIntent { json: String },
@@ -60,7 +48,7 @@ pub enum CognitiveOutput {
     LogMessage { level: u8, text: String },
 }
 
-/// Lock-free SPSC channel for sending events into the cognitive loop.
+/// Lock-free SPSC channel for events.
 pub struct EventChannel {
     buffer: [RwLock<Option<CognitiveEvent>>; 128],
     write_seq: std::sync::atomic::AtomicU64,
@@ -109,6 +97,12 @@ pub struct CognitiveDaemon {
     running: AtomicBool,
     paused: AtomicBool,
     tick_interval: Duration,
+
+    /// Ticks since last consolidation pass
+    consolidation_counter: u64,
+
+    /// Previous sensor readings for delta detection (arousal spike)
+    prev_sensor_values: parking_lot::Mutex<Vec<(String, u8, f32)>>,
 }
 
 impl CognitiveDaemon {
@@ -124,7 +118,14 @@ impl CognitiveDaemon {
             running: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             tick_interval: Duration::from_millis(16),
+            consolidation_counter: 0,
+            prev_sensor_values: parking_lot::Mutex::new(Vec::with_capacity(8)),
         }
+    }
+
+    /// Read current neuromodulator levels.
+    pub fn read_modulators(&self) -> (f64, f64, f64) {
+        self.engine.lock().read_modulators()
     }
 
     pub fn event_channel(&self) -> Arc<EventChannel> {
@@ -159,64 +160,44 @@ impl CognitiveDaemon {
 
             // ── 1. Drain event channel ──
             while let Some(event) = self.event_channel.recv() {
-                match event {
-                    CognitiveEvent::Shutdown => {
-                        self.running.store(false, Ordering::Release);
-                        return;
-                    }
-                    CognitiveEvent::Pause => {
-                        self.paused.store(true, Ordering::Release);
-                    }
-                    CognitiveEvent::Resume => {
-                        self.paused.store(false, Ordering::Release);
-                    }
-                    CognitiveEvent::Intent { json, .. } => {
-                        let parsed = parse_intent(&json);
-                        let mut engine = self.engine.lock();
-                        for frame in &parsed.frames {
-                            engine.inject_frame(frame, BASE_INJECT * parsed.confidence);
-                        }
-                        // Anchor the intent to self
-                        if let Some(obj) = parsed.frames.first().and_then(|f| f.object) {
-                            self.ctx.link_to_self(Relation::HasProperty, obj);
-                        }
-                    }
-                    CognitiveEvent::SensorReading { sensor, channel, value, .. } => {
-                        let parsed = parse_sensor_event(&sensor, channel, value);
-                        let mut engine = self.engine.lock();
-                        for frame in &parsed.frames {
-                            engine.inject_frame(frame, BASE_INJECT);
-                        }
-                        // Anchor the sensor to self
-                        if let Some(inst) = parsed.frames.first().and_then(|f| f.instrument) {
-                            self.ctx.link_to_self(Relation::GroundedIn, inst);
-                        }
-                    }
-                    CognitiveEvent::TimerElapsed { timer_id } => {
-                        let node_id = NodeId::from_raw(timer_id);
-                        self.engine.lock().inject(node_id, BASE_INJECT * 0.5);
-                    }
-                    CognitiveEvent::GraphCommand { json } => {
-                        if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&json) {
-                            self.handle_graph_command(&cmd);
-                        }
-                    }
-                }
+                self.handle_event(event);
             }
 
-            // ── 2. Run activation tick ──
+            // ── 2. Run 4-phase activation tick ──
+            let mut prediction_errors: Vec<PredictionError> = Vec::new();
             if !self.paused.load(Ordering::Acquire) {
-                let fired = {
-                    let mut engine = self.engine.lock();
-                    engine.tick().to_vec()
-                };
+                let mut engine = self.engine.lock();
 
-                // ── 3. Anchor fired actions to self ──
+                let fired = engine.tick().to_vec();
+                prediction_errors = engine.prediction_errors.clone();
+
+                // ── 3. Process prediction errors → novelty spikes ──
+                //     Low prediction error over several consecutive ticks → reward signal
+                for err in &prediction_errors {
+                    let mut outputs = self.output_channel.write();
+                    outputs.push(CognitiveOutput::LogMessage {
+                        level: 2,
+                        text: format!(
+                            "Prediction error: {} (expected {:.3}, got {:.3}, mag={:.3})",
+                            err.node_id.0, err.expected, err.actual, err.error_magnitude
+                        ),
+                    });
+                }
+
+                // Reward: spike if no prediction errors for 5+ consecutive ticks
+                if prediction_errors.is_empty() {
+                    let tick = self.ctx.tick.load(Ordering::Relaxed);
+                    if tick > 0 && tick % 100 == 0 {
+                        engine.spike_reward(0.05); // small tonic reward for stable predictions
+                    }
+                }
+
+                // ── 4. Anchor fired actions to self ──
                 for action in &fired {
                     self.ctx.link_to_self(Relation::CausedBy, action.node_id);
                 }
 
-                // ── 4. Dispatch fired actions ──
+                // ── Dispatch fired actions ──
                 let mut outputs = self.output_channel.write();
                 for action in &fired {
                     match &action.grounding {
@@ -253,13 +234,128 @@ impl CognitiveDaemon {
                 }
             }
 
-            // ── 4. Sleep remaining of tick interval ──
+            // ── 5. Consolidation check (every ~1000 ticks = ~16s) ──
+            self.consolidation_counter += 1;
+            if self.consolidation_counter >= 1000 {
+                self.consolidation_counter = 0;
+                let mut engine = self.engine.lock();
+                let (n, a, r) = engine.read_modulators();
+                if n < 0.1 && a < 0.1 {
+                    // Low neuromodulator activity = "idle" → safe to consolidate
+                    let pruned = self.run_consolidation_pass();
+                    if pruned > 0 {
+                        let mut outputs = self.output_channel.write();
+                        outputs.push(CognitiveOutput::LogMessage {
+                            level: 1,
+                            text: format!("Consolidation: pruned {} edges", pruned),
+                        });
+                    }
+                }
+            }
+
+            // ── 6. Sleep remaining of tick interval ──
             let elapsed = loop_start.elapsed();
             if elapsed < self.tick_interval {
                 std::thread::sleep(self.tick_interval - elapsed);
             }
         }
     }
+
+    // ── Event handling ─────────────────────────────────
+
+    fn handle_event(&self, event: CognitiveEvent) {
+        match event {
+            CognitiveEvent::Shutdown => {
+                self.running.store(false, Ordering::Release);
+            }
+            CognitiveEvent::Pause => {
+                self.paused.store(true, Ordering::Release);
+            }
+            CognitiveEvent::Resume => {
+                self.paused.store(false, Ordering::Release);
+            }
+            CognitiveEvent::Intent { json, .. } => {
+                let parsed = parse_intent(&json);
+                let mut engine = self.engine.lock();
+                for frame in &parsed.frames {
+                    engine.inject_frame(frame, BASE_INJECT * parsed.confidence);
+                }
+                if let Some(obj) = parsed.frames.first().and_then(|f| f.object) {
+                    self.ctx.link_to_self(Relation::HasProperty, obj);
+                }
+            }
+            CognitiveEvent::SensorReading { sensor, channel, value, .. } => {
+                // ── Arousal spike on rapid sensor delta ──
+                let prev_value = {
+                    let sensors = self.prev_sensor_values.lock();
+                    sensors.iter()
+                        .find(|(s, c, _)| s == &sensor && *c == channel)
+                        .map(|(_, _, v)| *v)
+                };
+                if let Some(prev) = prev_value {
+                    let delta = (value - prev).abs();
+                    if delta > 0.5 {
+                        self.engine.lock().spike_arousal((delta * 0.1).clamp(0.0, 0.5));
+                    }
+                }
+                // Update stored sensor value (retain all except this one, then push new)
+                let mut sensors = self.prev_sensor_values.lock();
+                sensors.retain(|(s, c, _)| !(s == &sensor && *c == channel));
+                sensors.push((sensor.clone(), channel, value));
+
+                let parsed = parse_sensor_event(&sensor, channel, value);
+                let mut engine = self.engine.lock();
+                for frame in &parsed.frames {
+                    engine.inject_frame(frame, BASE_INJECT);
+                }
+                if let Some(inst) = parsed.frames.first().and_then(|f| f.instrument) {
+                    self.ctx.link_to_self(Relation::GroundedIn, inst);
+                }
+            }
+            CognitiveEvent::TimerElapsed { timer_id } => {
+                let node_id = NodeId::from_raw(timer_id);
+                self.engine.lock().inject(node_id, BASE_INJECT * 0.5);
+            }
+            CognitiveEvent::GraphCommand { json } => {
+                if let Ok(cmd) = serde_json::from_str::<serde_json::Value>(&json) {
+                    self.handle_graph_command(&cmd);
+                }
+            }
+            CognitiveEvent::Modulate { channel, amount } => {
+                let mut engine = self.engine.lock();
+                match channel.as_str() {
+                    "novelty" => engine.spike_novelty(amount),
+                    "arousal" => engine.spike_arousal(amount),
+                    "reward" => engine.spike_reward(amount),
+                    _ => {}
+                }
+            }
+            CognitiveEvent::Consolidate => {
+                let pruned = self.run_consolidation_pass();
+                if pruned > 0 {
+                    let mut outputs = self.output_channel.write();
+                    outputs.push(CognitiveOutput::LogMessage {
+                        level: 1,
+                        text: format!("Consolidation: pruned {} edges", pruned),
+                    });
+                }
+            }
+        }
+    }
+
+    // ── Consolidation pass ─────────────────────────────
+
+    /// Run one pass of offline consolidation (pruning dead edges).
+    /// Returns number of edges removed.
+    fn run_consolidation_pass(&self) -> usize {
+        let mut graph = self.ctx.graph.write();
+        let before = graph.len();
+        graph.garbage_collect_edges();
+        before - graph.len()
+        // Future: linear chain compression, dead-end node removal
+    }
+
+    // ── Graph commands ─────────────────────────────────
 
     fn handle_graph_command(&self, cmd: &serde_json::Value) {
         let op = cmd.get("op").and_then(|v| v.as_str()).unwrap_or("");
@@ -300,11 +396,13 @@ impl CognitiveDaemon {
                     _ => Relation::AssociatedWith,
                 };
                 if let Some(node) = graph.get(NodeId::from_raw(src)) {
-                    node.write().edges.push(Edge {
-                        relation: rel,
-                        target: NodeId::from_raw(dst),
-                        weight_override: cmd.get("weight").and_then(|v| v.as_f64()),
-                    });
+                    let override_w = cmd.get("weight").and_then(|v| v.as_f64());
+                    let mut edge = Edge::new(rel, NodeId::from_raw(dst));
+                    if let Some(w) = override_w {
+                        edge.weight_override = Some(w);
+                        edge.dynamic_weight = w;
+                    }
+                    node.write().edges.push(edge);
                 }
             }
             _ => {}

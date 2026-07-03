@@ -120,6 +120,14 @@ impl CognitiveLifecycle {
         }
     }
 
+    /// Read current neuromodulator levels (novelty, arousal, reward).
+    pub fn read_modulators(&self) -> (f64, f64, f64) {
+        self.daemon
+            .as_ref()
+            .map(|d| d.read_modulators())
+            .unwrap_or((0.0, 0.0, 0.0))
+    }
+
     /// Number of consecutive missed heartbeats.
     pub fn missed_heartbeats(&self) -> u64 {
         self.missed_heartbeats.load(Ordering::Relaxed)

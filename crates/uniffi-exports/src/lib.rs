@@ -85,3 +85,18 @@ pub fn semantic_engine_inspect_prompt(prompt: String) -> Vec<String> {
 pub fn semantic_engine_tick_count() -> u64 {
     hw_daemon::tick_count()
 }
+
+#[uniffi::export]
+pub fn semantic_engine_modulate(channel: String, amount: f64) {
+    hw_daemon::modulate(&channel, amount);
+}
+
+#[uniffi::export]
+pub fn semantic_engine_trigger_consolidation() {
+    hw_daemon::trigger_consolidation();
+}
+
+#[uniffi::export]
+pub fn semantic_engine_read_modulators() -> String {
+    hw_daemon::read_modulators()
+}

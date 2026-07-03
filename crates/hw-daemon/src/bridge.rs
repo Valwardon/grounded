@@ -102,6 +102,41 @@ pub fn graph_command(json: &str) {
     }
 }
 
+/// Spike a neuromodulator channel (novelty, arousal, or reward) from external source.
+/// Amount is clamped to [0.0, 1.0].
+pub fn modulate(channel: &str, amount: f64) {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        if let Some(ref chan) = lc.event_channel() {
+            chan.send(cognitive_core::CognitiveEvent::Modulate {
+                channel: channel.to_string(),
+                amount: amount.clamp(0.0, 1.0),
+            });
+        }
+    }
+}
+
+/// Request an offline consolidation pass (pruning + chunking).
+/// The engine will consolidate when neuromodulator levels are low.
+pub fn trigger_consolidation() {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        if let Some(ref chan) = lc.event_channel() {
+            chan.send(cognitive_core::CognitiveEvent::Consolidate);
+        }
+    }
+}
+
+/// Return current neuromodulator levels as a JSON string.
+pub fn read_modulators() -> String {
+    let guard = lifecycle().read();
+    if let Some(ref lc) = *guard {
+        let (n, a, r) = lc.read_modulators();
+        return serde_json::json!({ "novelty": n, "arousal": a, "reward": r }).to_string();
+    }
+    "{}".to_string()
+}
+
 /// Called on memory pressure to persist graph state.
 pub fn trim_memory() {
     let guard = lifecycle().read();

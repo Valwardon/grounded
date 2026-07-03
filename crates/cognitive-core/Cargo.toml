@@ -6,6 +6,7 @@ description = "Spreading activation daemon — background inference via energy p
 
 [dependencies]
 serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 parking_lot = { workspace = true }
 bincode = { workspace = true }
 semantic-graph = { path = "../semantic-graph" }
