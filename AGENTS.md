@@ -171,8 +171,16 @@ Frames define mandatory relational slots:
 Phase 1 — Neuromodulator Decay (O(1)):
   novelty/arousal/reward leak toward baseline (8%/12%/4%)
 
-Phase 2 — Decay + Injection + Precision-Weighted Prediction Error (O(N)):
+Phase 2 — Decay + Injection + Workspace Resonance + Belief Tracking
+          + Precision-Weighted Prediction Error (O(N)):
   activation[i] *= node.decay * 0.97 + injection[i]
+  if node is in workspace: activation[i] += 0.15 (resonance injection)
+  if node is StableBelief:
+    if activation[i] > BELIEF_CONFIRMATION_THRESHOLD (0.7):
+      belief_streak[i]++, belief_confidence[i] = streak / BELIEF_CONFIRMATION_TICKS (5)
+    else:
+      belief_streak[i] = 0, belief_confidence[i] = 0
+  cache node.epistemic_status → node_epistemic[i] (for Phase 3 gating)
   if prediction exists:
     raw_error = |actual - expected| / max(expected, 0.001)
     precision = clamp(1.0 / (variance + 0.001), 0.1, 10.0)
@@ -181,25 +189,33 @@ Phase 2 — Decay + Injection + Precision-Weighted Prediction Error (O(N)):
     variance += 0.05 * ((actual - expected)^2 - variance)
     if weighted_error > PREDICTION_ERROR_THRESHOLD → novelty spike
 
-Phase 3 — Sparse Spread + Firing + Eligibility (O(N+E)):
+Phase 3 — Sparse Spread + Epistemic Gating + Firing + Eligibility (O(N+E)):
+  for each edge spread:
+    epistemic gate: skip if:
+      source=TransientObservation ∧ target=CoreConcept
+      source=StableBelief ∧ target=CoreConcept ∧ belief_confidence[source] < 0.7
   if activation > threshold * threshold_mod:
     fire(i), push index to FiredNodesBuffer[count++]
     if MotorCommand → push RenderCommand + prediction
   else:
     if edge_count > SPARSE_SPREAD_MAX_EDGES (64):
       sort edges by dynamic_weight desc, truncate to 64
-    spread energy to neighbors (conservation)
+    spread energy to neighbors (skip gated edges)
     terminate when remaining energy < SPARSE_SPREAD_MIN_ENERGY (0.005)
 
 Phase 4 — Event-Driven STDP + Pruning (O(F·avg_degree)):
+  if cognitive_mode == Counterfactual: SKIP entire phase
   for each fired node i in FiredNodesBuffer:
-    for each edge of i: decay eligibility, LTP/LTD
+    for each edge of i:
+      if edge.contract == TransientWorkspace: SKIP (ephemeral)
+      decay eligibility, LTP/LTD
     for each pair (i, j) in FiredNodesBuffer (j > i):
       if (i,j) not in processed_pairs:
         find edge i→j or j→i, apply LTP/LTD, mark processed
   clear FiredNodesBuffer (count = 0)
 
 Phase 5 — Valence Update (O(N)):
+  if cognitive_mode == Counterfactual: SKIP entire phase
   fire + error → negative; fire + no error → positive; SELF → +0.5 baseline
 
 Phase 6 — Structural Verification + Visual Push (O(N+E)):
@@ -398,6 +414,78 @@ Fixed-size SPSC ring buffer (no mutex, no RwLock):
 - `Sync` because all fields are `AtomicU64`
 - No spinning, no allocations, no locks
 
+## Cognitive Architecture Upgrades
+
+### 1. Epistemic Node Separation
+
+Three-tier epistemic status on every `GroundedNode`:
+
+| Status | Role | Edge Constraints |
+|--------|------|-----------------|
+| `TransientObservation` | Raw sensor input / immediate perception | Can only spread to `StableBelief` via `Relation::SupportsBelief` |
+| `StableBelief` | Accumulated pattern across multiple ticks | Propagates to `CoreConcept` only when confidence > 0.7 for ≥5 ticks |
+| `CoreConcept` | Permanent structural knowledge (default) | Receives energy only from confirmed beliefs; no direct observation link |
+
+**Mechanism**: During Phase 2, each node's `epistemic_status` is cached in `node_epistemic[]`. During Phase 3 spread, the engine checks `node_epistemic` for both source and target:
+- `TransientObservation → CoreConcept`: **blocked** (observations cannot directly modify concepts)
+- `StableBelief → CoreConcept`: allowed only if `belief_confidence[source] >= 0.7`
+
+`belief_confidence[i]` is tracked as a separate linear array (indexed by `NodeId.0`), updated each tick based on activation level.
+
+**Added types**: `EpistemicStatus` enum (3 variants), `Relation::SupportsBelief` (spread_weight=0.6, contract=DataFlow{State→State})
+
+### 2. Working Memory Workspace
+
+Stack-allocated context buffer that preserves attention across multi-step inference:
+
+```rust
+pub struct WorkingMemoryWorkspace {
+    slots: [NodeId; WORKSPACE_CAPACITY],  // WORKSPACE_CAPACITY = 12
+    count: usize,
+}
+```
+
+**Behavior**:
+- Every node in the workspace receives `+0.15` resonance injection during Phase 2
+- Edges created between workspace nodes via `link_workspace()` get `InvariantContract::TransientWorkspace`
+- TransientWorkspace edges are **skipped during Phase 4 (STDP)** — no weight updates
+- Consolidation drops all TransientWorkspace edges without serializing them
+- Wrap-around push (oldest dropped when full at count=12)
+
+**API**: `push_workspace()`, `clear_workspace()`, `in_workspace()`, `link_workspace()`, `workspace_snapshot()`
+
+### 3. Counterfactual Simulation Mode
+
+Isolated "what-if" mode that prevents long-term memory changes:
+
+```rust
+ActivationEngine::cognitive_mode: CognitiveMode  // Actual | Counterfactual
+```
+
+**Behavior**:
+- Phase 4 (STDP): **short-circuited** — no weight changes applied
+- Phase 5 (valence): **short-circuited** — no preference formation
+- Phase 3 and Phase 6: run normally (spread + verification still occur)
+- External events still arrive and activate nodes normally
+- `RenderCommand` dispatched with `render_target: CognitiveMode` — renderer routes to off-screen "ImaginationBuffer"
+
+**API**: `CognitiveDaemon::set_cognitive_mode(mode)`, `ActivationEngine::set_mode(mode)`
+
+### 4. Predictive-Role Abstraction (Category Synthesis v2)
+
+Two-pass category synthesis during consolidation:
+
+**Pass 1** (existing edge-signature clustering): 80% overlap on outbound edge relation+target tuples.
+
+**Pass 2** (new predictive-role clustering): 70% overlap on 2-hop predictive profiles:
+- `predictive_profile(node)`: 2-hop BFS (capped at 128 nodes), collects terminal nodes (`VisualPrimitive`, `MotorCommand`, `Sensor`)
+- `predictive_overlap(a, b)`: Jaccard index on terminal node sets
+- Cluster ≥3 nodes with ≥70% overlap → hoist parent, migrate downstream predictive edges
+
+TransientWorkspace edges are skipped in both passes. Nodes assigned in Pass 1 are excluded from Pass 2.
+
+**Key insight**: Two nodes that fire different intermediate concepts but activate the same set of visual primitives are predictively equivalent — they should share a parent category describing "things that look like X."
+
 ### SensorMapper (cognitive-core)
 
 Stateless fixed-point sensor→activation translator:
@@ -485,6 +573,16 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 ## Crate Map (Updated)
 
 ### semantic-graph additions
+- `EpistemicStatus` enum — `TransientObservation`, `StableBelief`, `CoreConcept` (serde)
+- `CognitiveMode` enum — `Actual`, `Counterfactual` (serde)
+- `Relation::SupportsBelief` — connects observation → belief (spread_weight=0.6)
+- `InvariantContract::TransientWorkspace` — ephemeral edge contract for workspace links
+- `GroundedNode.epistemic_status` — new field, defaults to `CoreConcept`
+- `WorkingMemoryWorkspace` — `{ slots: [NodeId; 12], count: usize }`
+- `WORKSPACE_CAPACITY = 12`, `WORKSPACE_RESONANCE_INJECT = 0.15`
+- `BELIEF_CONFIRMATION_TICKS = 5`, `BELIEF_CONFIRMATION_THRESHOLD = 0.7`
+- `GraphArena::link_workspace()` — create TransientWorkspace-contract edge
+- `GraphArena::garbage_collect_transient_edges() -> usize` — remove all TransientWorkspace edges
 - `VisualEffectorBuffer` — lock-free `[AtomicU64; 11]` double-buffered state
 - `effector_state` module — helpers for packing/unpacking the 22-element state array
 - `EFFECTOR_STATE_FLOATS` (22), `EFFECTOR_STATE_WORDS` (11) — layout constants
@@ -516,6 +614,24 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - `ActivationEngine::effector_buffer: Option<Arc<VisualEffectorBuffer>>` — written to during Phase 6
 - `ActivationEngine::visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>` — written to during Phase 6
 - `ActivationEngine::compute_effector_state()` — aggregates fired MotorCommand nodes into 22-element state array
+- `ActivationEngine::workspace: WorkingMemoryWorkspace` — stack-allocated attention buffer
+- `ActivationEngine::belief_confidence: Vec<f64>`, `belief_streak: Vec<u8>` — belief tracking arrays
+- `ActivationEngine::node_epistemic: Vec<EpistemicStatus>` — cached epistemic status for zero-lock gating
+- `ActivationEngine::cognitive_mode: CognitiveMode` — `Actual` or `Counterfactual`
+- `ActivationEngine::set_mode()`, `mode()`, `push_workspace()`, `clear_workspace()`, `link_workspace()`
+- `CognitiveDaemon::set_cognitive_mode()` — public API for mode switching
+- `CognitiveOutput::RenderCommand.render_target: CognitiveMode` — routes to ImaginationBuffer in Counterfactual mode
+- Phase 2: workspace resonance (+0.15) + belief confidence tracking
+- Phase 3: epistemic status gating (TransientObservation→CoreConcept blocked, StableBelief→CoreConcept gated by confidence)
+- Phase 4: counterfactual short-circuit + TransientWorkspace edge skip
+- Phase 5: counterfactual short-circuit
+- `consolidation.rs`: predictive-role abstraction (Pass 2 in synthesize_categories, 70% overlap threshold)
+- `predictive_profile()` — 2-hop BFS to terminal nodes (VisualPrimitive/MotorCommand/Sensor)
+- `predictive_overlap()` — Jaccard index on predictive profiles
+- `hoist_clusters()` — shared code for both edge-signature and predictive-role hoisting
+- `ActivationEngine::effector_buffer: Option<Arc<VisualEffectorBuffer>>` — written to during Phase 6
+- `ActivationEngine::visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>` — written to during Phase 6
+- `ActivationEngine::compute_effector_state()` — aggregates fired MotorCommand nodes into 22-element state array
 - `CognitiveDaemon::new(ctx, effector_buffer, visual_ring)` — accepts both buffers, passes to ActivationEngine
 - `SensorMapper` — stateless fixed-point sensor→visual primitive injection mapper
 - `SensorMapper::map_accelerometer(gx, gy, gz) -> [(NodeId; f64); 3]` — accelerometer→rotation triad
@@ -530,6 +646,32 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - Phase 4: event-driven STDP (incident-only via FiredNodesBuffer + processed_pairs)
 - `ConsolidationReport.categories_synthesized: usize` — tracks synthesized categories
 - `consolidation.rs: synthesize_categories()` — isomorphism scanner, cluster detection (3+ nodes ≥80% signature overlap), parent node creation with IsA anchoring
+
+### cognitive-core additions (this session)
+- `SelfHealingHook` trait (scheduler.rs:38) — `pub trait SelfHealingHook: Send { fn run_self_healing(&mut self) -> String; }`. Exported via `pub use scheduler::*`.
+- `CognitiveDaemon::self_healing_hook` — `parking_lot::Mutex<Option<Box<dyn SelfHealingHook>>>`. Called during idle consolidation (same `novelty < 0.1 && arousal < 0.1` window as garbage collection).
+- `CognitiveDaemon::set_self_healing_hook(hook)` — public setter for attaching the metacognition pipeline.
+
+### metacognition crate (new, this session)
+- `CapabilityMetrics` — 4 `AtomicU64` fields (mean_latency_ns, memory_footprint, success_rate_ppm, sample_count), EMA update via `record_sample()`.
+- `Constraint` — target_label, max_latency, max_memory, min_success_rate, max_violations_before_remedy (default 5), builder methods `with_max_latency()`, `with_max_memory()`, `with_min_success_rate()`, `with_max_violations()`.
+- `DeficiencyScanner` — register constraints, update metrics, scan() returns pending reports. Tracks consecutive violations per constraint.
+- `ModuleRegistry` — holds 6 boxed trait objects (4 Layer 1 + 2 Layer 2), `new(ctx)` seeds stock implementations, `get_layer1_mut(id)` for swap targeting.
+- Layer 1 traits: `CognitiveParser`, `FrameMatcher`, `CuriosityScheduler`, `GapDetectorModule` (all require `Send + Sync + box_clone() + metrics()`).
+- Layer 2 traits: `ExplorationPolicy`, `InferenceOrder`.
+- Stock implementations: `StockCognitiveParser` (wraps `RelationalParser`), `StockFrameMatcher`, `StockCuriosityScheduler` (highest-budget gap), `StockGapDetector` (label lookup), `StockExplorationPolicy` (budget order), `StockInferenceOrder` (insertion order).
+- DSL opcodes: 18 safe operations (`LoadInput`, `LoadState`, `StoreState`, `PushConst`, `Add`, `Sub`, `Mul`, `Div`, `LessThan`, `GreaterThan`, `And`, `Or`, `Clamp`, `Select`, `MatchLabel`, `FrameOverlap`, `EmitFrame`, `Halt`). `CompiledLogic` with native fn pointer + bytecode interpreter fallback (`[f64; 16]` stack, 256B state buffer).
+- `SwapSlot<T>` — lock-free double buffer with `AtomicU64` generation counter. `ModuleSwapTable` wraps 4 swap slots + 2 Arc<Mutex>.
+- `SelfHealingPipeline` — 5-phase pipeline (Generation → Contract Verification → Regression Testing → Ecological Benchmarking → Hot-Swap). Implements `SelfHealingHook`. Replaces modules when candidate is ≥5% faster with >95% success rate.
+- `SelfHealingPipeline::run_cycle()` — scans deficiencies, picks most severe, generates candidate DSL bytecode, validates, runs regression tests, benchmarks stock vs candidate on sample loop, hot-swaps if improvement detected.
+- `MetacognitiveBudgetAllocator` — extended budget formula with `deficiency_severity * 0.1` term. Routes `≥30%` of curiosity budget inward when deficiency severity `>0.3`.
+- `MetacognitiveCuriosity` — wraps `CuriosityBudget` with deficiency scanning, budget split, and pipeline allocation decisions.
+
+### hw-daemon additions (this session)
+- `Cargo.toml` — added `metacognition` dependency.
+- `lifecycle.rs:84-103` — `on_create()` creates `ModuleRegistry` + `SelfHealingPipeline`, registers default parser `Constraint` (5ms max latency, 90% min success rate), attaches pipeline to daemon via `set_self_healing_hook()`.
+- Imports: `SelfHealingHook`, `SelfHealingPipeline`, `ModuleRegistry`, `Constraint`.
+- **`StockCognitiveParser::parse()` metrics bug fixed** — `self.metrics.clone()` → `self.metrics.record_sample()` (clone was updating a temporary). Success polarity: `0.0` for empty frames, `1.0` for non-empty.
 
 ## Critical Rules for Agent
 
@@ -549,3 +691,8 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 14. Sparse spread: only sort edges when `edge_count > SPARSE_SPREAD_MAX_EDGES` (64). Normal-degree nodes iterate all edges without sorting.
 15. `FiredNodesBuffer` must be cleared at end of Phase 4 (`fired_nodes_count = 0`). The raw buffer array is not zeroed — stale indices are overwritten by next Phase 3 push.
 16. Path cache must be invalidated (`.fill(None)`) on every structural mutation: `insert`, `insert_at`, `link_to_self`, `garbage_collect_edges`. Never skip invalidation.
+17. `TransientObservation` nodes must never receive `Relation::SupportsBelief` edges to `CoreConcept` targets. Only `StableBelief` nodes may propagate to concepts, and only after `belief_confidence >= BELIEF_CONFIRMATION_THRESHOLD`.
+18. Workspace capacity is fixed at 12. Never resize; overflow wraps around (oldest evicted). Never add dynamic allocation in the workspace hot path.
+19. TransientWorkspace edges must be skipped in all consolidation passes: `extract_edge_signature`, `compress_linear_chains`, `synthesize_categories`, and `garbage_collect_edges`. They are ephemeral by design.
+20. Counterfactual mode must short-circuit both Phase 4 (STDP) and Phase 5 (valence). Phase 3 and Phase 6 must still run normally. Do not skip event processing in counterfactual mode.
+21. Predictive-role profiles are bounded at 128 nodes. Never run unbounded BFS. Profile extraction uses a `Vec<u64>` frontier, not recursion.

@@ -1,7 +1,9 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use cognitive_core::CognitiveDaemon;
+use std::time::Duration;
+use cognitive_core::{CognitiveDaemon, SelfHealingHook};
+use metacognition::{SelfHealingPipeline, ModuleRegistry, Constraint};
 use semantic_graph::prelude::*;
 use crate::render_bridge::{RenderBridge, NullRenderBackend};
 
@@ -80,9 +82,29 @@ impl CognitiveLifecycle {
         self.render_bridge = Some(parking_lot::Mutex::new(bridge));
 
         // Pass the shared buffers to CognitiveDaemon
-        self.daemon = Some(Arc::new(CognitiveDaemon::new(
-            ctx, Some(effector_buffer), Some(visual_ring),
-        )));
+        let daemon = Arc::new(CognitiveDaemon::new(
+            ctx.clone(), Some(effector_buffer), Some(visual_ring),
+        ));
+        self.daemon = Some(daemon.clone());
+
+        // ── Initialize the self-healing pipeline (metacognition) ──
+        // Creates a ModuleRegistry with stock implementations, registers
+        // default constraints on Layer 1 modules, and wires the
+        // SelfHealingPipeline into the daemon's idle consolidation cycle.
+        let mut registry = ModuleRegistry::new(ctx.clone());
+        let mut pipeline = SelfHealingPipeline::new(ctx.clone());
+        pipeline.initialize(&registry);
+
+        // Register default performance constraints for the parser module
+        pipeline.register_constraint(
+            Constraint::new("stock_ccg_parser")
+                .with_max_latency(Duration::from_millis(5))
+                .with_min_success_rate(0.90)
+                .with_max_violations(5),
+        );
+
+        // Attach the pipeline to the daemon's idle consolidation pass
+        daemon.set_self_healing_hook(Box::new(pipeline));
     }
 
     /// Start the cognitive background loop + render bridge.
@@ -320,6 +342,7 @@ impl CognitiveLifecycle {
                 node_type: NodeType::Sensor,
                 grounding: Grounding::Sensor { sensor_type: sensor_type.into(), channel, norm },
                 decay, threshold, base_activation: 0.0, edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(target))],
+                epistemic_status: EpistemicStatus::CoreConcept,
                 valence: 0.0,
                 mean_error: 0.0,
                 variance: 0.0,
@@ -330,6 +353,7 @@ impl CognitiveLifecycle {
             GroundedNode {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::Concept,
                 grounding: Grounding::Abstract, decay, threshold, base_activation: 0.0, edges,
+                epistemic_status: EpistemicStatus::CoreConcept,
                 valence: 0.0,
                 mean_error: 0.0,
                 variance: 0.0,
@@ -341,6 +365,7 @@ impl CognitiveLifecycle {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::Action,
                 grounding: Grounding::Action { intent_template: intent_template.into() },
                 decay, threshold, base_activation: 0.0, edges: Vec::new(),
+                epistemic_status: EpistemicStatus::CoreConcept,
                 valence: 0.0,
                 mean_error: 0.0,
                 variance: 0.0,
@@ -352,6 +377,7 @@ impl CognitiveLifecycle {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::VisualPrimitive,
                 grounding: Grounding::VisualPrimitive { primitive_type },
                 decay: 0.95, threshold, base_activation: 0.0, edges,
+                epistemic_status: EpistemicStatus::CoreConcept,
                 valence: 0.0,
                 mean_error: 0.0,
                 variance: 0.0,
@@ -363,6 +389,7 @@ impl CognitiveLifecycle {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::State,
                 grounding: Grounding::Stored { keyspace: keyspace.into(), key: key.into() },
                 decay, threshold: f64::MAX, base_activation: 0.0, edges,
+                epistemic_status: EpistemicStatus::CoreConcept,
                 valence: 0.0,
                 mean_error: 0.0,
                 variance: 0.0,

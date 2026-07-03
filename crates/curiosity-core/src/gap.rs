@@ -270,6 +270,7 @@ mod tests {
                 Edge::new(Relation::IsA, NodeId::from_raw(2)), // "animal"
                 Edge::new(Relation::HasProperty, NodeId::from_raw(3)), // "quadruped"
             ],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -285,6 +286,7 @@ mod tests {
             threshold: 10.0,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::HasProperty, NodeId::from_raw(3))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -300,6 +302,7 @@ mod tests {
             threshold: 10.0,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::HasProperty, cat_id)],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,

@@ -22,10 +22,27 @@ use crate::SensorMapper;
 //        2. Run one 4-phase tick (decay/inject/spread/fire + STDP)
 //        3. Process prediction errors → spike novelty
 //        4. Dispatch fired actions → output channel
-//        5. Optional: trigger consolidation if idle
+//        5. Optional: trigger consolidation if idle (also runs
+//           self-healing pipeline via SelfHealingHook)
 //        6. Sleep remaining of 16ms slot
 //    }
+//
+//  Self-healing integration:
+//    The CognitiveDaemon optionally holds a SelfHealingHook (implemented
+//    by the metacognition crate's SelfHealingPipeline). During idle
+//    consolidation cycles (novelty < 0.1, arousal < 0.1), the daemon
+//    calls hook.run_self_healing() to detect and remedy performance
+//    regressions in Layer 1 cognitive modules.
 // ────────────────────────────────────────────────────────────
+
+/// Hook for the metacognition self-healing pipeline.
+///
+/// Implemented by metacognition::pipeline::SelfHealingPipeline.
+/// The daemon calls this during idle consolidation cycles.
+pub trait SelfHealingHook: Send {
+    /// Run one self-healing cycle. Returns a human-readable summary.
+    fn run_self_healing(&mut self) -> String;
+}
 
 #[derive(Debug, Clone)]
 pub enum CognitiveEvent {
@@ -53,10 +70,13 @@ pub enum CognitiveOutput {
     /// Render command from the motor effector system.
     /// The renderer should execute this and feed back the result via
     /// ActivationEngine::process_render_feedback().
+    /// When render_target is Counterfactual, the renderer should route
+    /// to an off-screen imagination buffer instead of the main framebuffer.
     RenderCommand {
         command_type: String,
         target: String,
         parameters: Vec<f64>,
+        render_target: CognitiveMode,
     },
 }
 
@@ -127,6 +147,11 @@ pub struct CognitiveDaemon {
     first_tick: std::sync::atomic::AtomicBool,
     /// Which "interest" node the DMN is currently focused on (0 = none)
     dmn_focus: std::sync::atomic::AtomicU64,
+
+    /// Optional self-healing pipeline hook (metacognition crate).
+    /// Called during idle consolidation to detect and remedy performance
+    /// regressions in Layer 1 cognitive modules.
+    self_healing_hook: parking_lot::Mutex<Option<Box<dyn SelfHealingHook>>>,
 }
 
 impl CognitiveDaemon {
@@ -155,6 +180,7 @@ impl CognitiveDaemon {
             ticks_since_last_event: std::sync::atomic::AtomicU64::new(0),
             first_tick: std::sync::atomic::AtomicBool::new(true),
             dmn_focus: std::sync::atomic::AtomicU64::new(NodeId::SELF.0),
+            self_healing_hook: parking_lot::Mutex::new(None),
         }
     }
 
@@ -260,6 +286,21 @@ impl CognitiveDaemon {
         self.running.load(Ordering::Relaxed)
     }
 
+    /// Attach a self-healing pipeline hook.
+    /// Called during idle consolidation to detect and remedy performance
+    /// regressions in Layer 1 cognitive modules (parser, matcher, etc.).
+    pub fn set_self_healing_hook(&self, hook: Box<dyn SelfHealingHook>) {
+        *self.self_healing_hook.lock() = Some(hook);
+    }
+
+    /// Set the cognitive mode for the next tick.
+    /// Counterfactual mode short-circuits STDP and valence updates,
+    /// allowing "what if" simulation without long-term memory changes.
+    pub fn set_cognitive_mode(&self, mode: CognitiveMode) {
+        let mut engine = self.engine.lock();
+        engine.set_mode(mode);
+    }
+
     pub fn start(self: &Arc<Self>) {
         self.running.store(true, Ordering::Release);
         let daemon = self.clone();
@@ -352,10 +393,12 @@ impl CognitiveDaemon {
                             });
                         }
                         Grounding::MotorCommand { command_type, target, parameters } => {
+                            let mode = engine.mode();
                             outputs.push(CognitiveOutput::RenderCommand {
                                 command_type: command_type.label().to_string(),
                                 target: target.clone(),
                                 parameters: parameters.clone(),
+                                render_target: mode,
                             });
                         }
                         _ => {
@@ -371,11 +414,13 @@ impl CognitiveDaemon {
                 }
 
                 // ── Dispatch render commands (from effector nodes) ──
+                let render_mode = engine.mode();
                 for cmd in &engine.pending_render_commands {
                     outputs.push(CognitiveOutput::RenderCommand {
                         command_type: cmd.command_type.label().to_string(),
                         target: cmd.target.clone(),
                         parameters: cmd.parameters.clone(),
+                        render_target: render_mode,
                     });
                 }
 
@@ -397,6 +442,20 @@ impl CognitiveDaemon {
                         outputs.push(CognitiveOutput::LogMessage {
                             level: 1,
                             text: format!("Consolidation: pruned {} edges", pruned),
+                        });
+                    }
+
+                    // ── Self-healing pipeline (if attached) ──
+                    // Run the metacognition pipeline during the same idle window.
+                    // The pipeline detects performance regressions, generates
+                    // candidate module rewrites, benchmarks them, and hot-swaps
+                    // if they improve latency or success rate.
+                    if let Some(ref mut hook) = *self.self_healing_hook.lock() {
+                        let summary = hook.run_self_healing();
+                        let mut outputs = self.output_channel.write();
+                        outputs.push(CognitiveOutput::LogMessage {
+                            level: 1,
+                            text: summary,
                         });
                     }
                 }
@@ -562,6 +621,7 @@ impl CognitiveDaemon {
                         threshold: cmd.get("threshold").and_then(|v| v.as_f64()).unwrap_or(f64::MAX),
                         base_activation: cmd.get("base").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         edges: Vec::new(),
+                        epistemic_status: EpistemicStatus::CoreConcept,
                         valence: 0.0,
                         mean_error: 0.0,
                         variance: 0.0,

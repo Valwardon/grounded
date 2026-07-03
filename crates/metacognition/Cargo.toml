@@ -1,0 +1,13 @@
+[package]
+name = "metacognition"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+semantic-graph = { path = "../semantic-graph" }
+cognitive-core = { path = "../cognitive-core" }
+curiosity-core = { path = "../curiosity-core" }
+semantic-parser = { path = "../semantic-parser" }
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true

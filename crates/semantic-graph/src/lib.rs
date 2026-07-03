@@ -26,6 +26,38 @@ pub const PRUNE_THRESHOLD: f64 = 0.005;
 /// Prediction error threshold (fractional deviation) that triggers novelty spike
 pub const PREDICTION_ERROR_THRESHOLD: f64 = 0.3;
 
+/// Epistemic status of a node — what epistemic category it belongs to.
+///
+/// Observations are transient raw sensor readings that feed into beliefs.
+/// Beliefs accumulate confidence over multiple ticks before affecting
+/// long-term core concepts. Core concepts are persistent and can only
+/// be modified by well-established beliefs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum EpistemicStatus {
+    /// Raw sensor input, directly grounded to hardware. Cannot alter CoreConcept weights.
+    TransientObservation,
+    /// Tentative hypothesis built from multiple observations.
+    /// Accumulates confidence over ticks; only propagates to CoreConcept
+    /// when confidence exceeds threshold.
+    StableBelief,
+    /// Long-term, stable concept that defines the system's core ontology.
+    /// Only modified by well-established beliefs with high confidence.
+    CoreConcept,
+}
+
+/// The mode the cognitive engine is operating in.
+///
+/// `Actual` — normal operation: STDP updates weights, valence drives preference.
+/// `Counterfactual` — isolated imagination: Phase 4 (STDP) and Phase 5 (valence)
+/// are short-circuited. The tick runs but no permanent learning occurs.
+/// Render commands get tagged with `ImaginationBuffer` so the wgpu thread
+/// can route them to a separate render target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CognitiveMode {
+    Actual,
+    Counterfactual,
+}
+
 // ────────────────────────────────────────────────────────────
 //  Node identity
 // ────────────────────────────────────────────────────────────
@@ -87,6 +119,10 @@ pub enum InvariantContract {
     Grounding,
     /// No formal contract — reliance on STDP-learned weight only
     Unspecified,
+    /// Edge created between two nodes in the working memory workspace.
+    /// Bypassed during sleep consolidation and garbage collection;
+    /// fades naturally unless explicitly reinforced.
+    TransientWorkspace,
 }
 
 /// Structural verification error.
@@ -162,6 +198,9 @@ pub enum Relation {
     Activates,
     Inhibits,
     AssociatedWith,
+    /// Connects a TransientObservation node to a StableBelief node.
+    /// Observations feed beliefs; beliefs accumulate confidence over time.
+    SupportsBelief,
 }
 
 impl Relation {
@@ -177,6 +216,7 @@ impl Relation {
             Relation::Activates => 1.0,
             Relation::Inhibits => -0.6,
             Relation::AssociatedWith => 0.3,
+            Relation::SupportsBelief => 0.6,
         }
     }
 
@@ -206,6 +246,10 @@ impl Relation {
                 input_type: DataType::Activation,
             },
             Relation::AssociatedWith => InvariantContract::Unspecified,
+            Relation::SupportsBelief => InvariantContract::DataFlow {
+                output_type: DataType::State,
+                input_type: DataType::State,
+            },
         }
     }
 }
@@ -328,6 +372,12 @@ pub struct GroundedNode {
     pub threshold: f64,
     pub base_activation: f64,
     pub edges: Vec<Edge>,
+
+    /// Epistemic category of this node:
+    ///   TransientObservation — raw sensor input, cannot alter CoreConcept weights.
+    ///   StableBelief — tentative hypothesis, accumulates confidence over ticks.
+    ///   CoreConcept — persistent ontology, only modified by high-confidence beliefs.
+    pub epistemic_status: EpistemicStatus,
 
     /// Valence: running average of positive/negative experience associated with this node.
     /// -1.0 (aversive) to +1.0 (attractive). Updated each tick based on co-occurrence
@@ -472,6 +522,7 @@ impl GraphArena {
             threshold: f64::MAX,
             base_activation: 0.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -486,6 +537,7 @@ impl GraphArena {
             threshold: f64::MAX,
             base_activation: 1.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.5,
             mean_error: 0.0,
             variance: 0.0,
@@ -645,6 +697,21 @@ impl GraphArena {
             node.edges.retain(|e| e.dynamic_weight.abs() >= PRUNE_THRESHOLD);
         }
         self.path_cache.lock().fill(None);
+    }
+
+    /// Remove all edges marked with the TransientWorkspace contract.
+    /// These are ephemeral workspace associations that should not persist
+    /// past the current context shift.
+    pub fn garbage_collect_transient_edges(&mut self) -> usize {
+        let mut total_removed = 0;
+        for node_lock in &self.nodes {
+            let mut node = node_lock.write();
+            let before = node.edges.len();
+            node.edges.retain(|e| e.effective_contract() != InvariantContract::TransientWorkspace);
+            total_removed += before - node.edges.len();
+        }
+        self.path_cache.lock().fill(None);
+        total_removed
     }
 
     // ── Incremental path cache ─────────────────────────────
@@ -1049,6 +1116,20 @@ impl SemanticContext {
 
     pub fn link_to_self(&self, relation: Relation, target: NodeId) -> bool {
         self.graph.write().link_to_self(relation, target)
+    }
+
+    /// Create an edge between two nodes with the TransientWorkspace contract.
+    /// These edges are ephemeral — they bypass STDP and are dropped during
+    /// consolidation. Returns true on success.
+    pub fn link_workspace(&mut self, source: NodeId, target: NodeId, relation: Relation) -> bool {
+        if source.0 as usize >= self.nodes.len() || target.0 as usize >= self.nodes.len() {
+            return false;
+        }
+        self.nodes[source.0 as usize].write().edges.push(
+            Edge::new(relation, target).with_contract(InvariantContract::TransientWorkspace)
+        );
+        self.path_cache.lock().fill(None);
+        true
     }
 }
 
@@ -1816,6 +1897,7 @@ pub mod prelude {
         SemanticRelation,
         PrimitiveVector, primitive_for, base_primitives,
         FrameSchema, SlotBinding, FrameInstance, frame_schemas,
+        EpistemicStatus, CognitiveMode,
     };
     pub use super::{
         Neuromodulator, FiringHistory, PredictionError,

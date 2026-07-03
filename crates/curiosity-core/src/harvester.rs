@@ -315,6 +315,7 @@ mod tests {
             threshold: 10.0,
             base_activation: 0.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,

@@ -5,28 +5,7 @@ use semantic_graph::prelude::*;
 use crate::{VerificationLoop, VerificationEvent};
 
 // ────────────────────────────────────────────────────────────
-//  Spreading activation engine — STDP + neuromodulation edition
-//
-//  This is the core "inference" mechanism. Every tick (~16ms):
-//
-//    Phase 1 — Neuromodulator decay:
-//      novelty, arousal, reward leak toward baseline.
-//      Compute global threshold_mod and plasticity_mod.
-//
-//    Phase 2 — Decay + Injection + Prediction Error:
-//      For each node: a *= node.decay * DECAY_GLOBAL; a += injection.
-//      Compare a against prediction from last tick → prediction error → novelty spike.
-//
-//    Phase 3 — Spreading activation + eligibility:
-//      For each non-fired node, propagate energy along edges.
-//      Track eligibility: boosted when source fires, decays each tick.
-//      Compute next-tick prediction from resulting activations.
-//
-//    Phase 4 — STDP + pruning:
-//      For each edge: drift toward default, LTP on co-firing, prune if too weak.
-//
-//  Deterministic: same graph + same event sequence → same activations.
-//  Zero allocations in hot path: all buffers pre-sized at init.
+//  Constants
 // ────────────────────────────────────────────────────────────
 
 pub const SPREAD_RATE: f64 = 0.15;
@@ -45,6 +24,68 @@ pub const SPARSE_SPREAD_MIN_ENERGY: f64 = 0.005;
 /// Capacity of the FiredNodesBuffer for event-driven STDP.
 /// Must be ≥ max expected firing nodes per tick.
 pub const FIRED_BUFFER_CAPACITY: usize = 1024;
+
+/// Size of the working memory workspace ring buffer.
+pub const WORKSPACE_CAPACITY: usize = 12;
+
+/// Injection bonus for nodes currently in the workspace (sustained resonance).
+pub const WORKSPACE_RESONANCE_INJECT: f64 = 0.15;
+
+/// Number of consecutive ticks a StableBelief node must have high activation
+/// before its energy can propagate to CoreConcept nodes.
+pub const BELIEF_CONFIRMATION_TICKS: u8 = 5;
+
+/// Activation threshold a StableBelief node must sustain to build confidence.
+pub const BELIEF_CONFIRMATION_THRESHOLD: f64 = 0.7;
+
+// ────────────────────────────────────────────────────────────
+//  Types
+// ────────────────────────────────────────────────────────────
+
+/// Stack-allocated working memory workspace — preserves context across
+/// multi-step inference chains without permanent consolidation.
+///
+/// Nodes pushed into the workspace represent the immediate focus of attention.
+/// They receive sustained resonance injection (+0.15/tick) to resist decay.
+/// Edges created between workspace nodes are marked TransientWorkspace and
+/// bypassed during sleep consolidation.
+pub struct WorkingMemoryWorkspace {
+    pub slots: [NodeId; WORKSPACE_CAPACITY],
+    pub count: usize,
+}
+
+impl WorkingMemoryWorkspace {
+    pub fn new() -> Self {
+        WorkingMemoryWorkspace {
+            slots: [NodeId::ZERO; WORKSPACE_CAPACITY],
+            count: 0,
+        }
+    }
+
+    /// Push a node into the workspace (round-robin overwrite when full).
+    pub fn push(&mut self, id: NodeId) {
+        if self.count < WORKSPACE_CAPACITY {
+            self.slots[self.count] = id;
+            self.count += 1;
+        } else {
+            // Shift left, drop oldest, append newest
+            for i in 1..WORKSPACE_CAPACITY {
+                self.slots[i - 1] = self.slots[i];
+            }
+            self.slots[WORKSPACE_CAPACITY - 1] = id;
+        }
+    }
+
+    /// Check if a node is currently in the workspace.
+    pub fn contains(&self, id: NodeId) -> bool {
+        self.slots[..self.count].contains(&id)
+    }
+
+    /// Clear the workspace.
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+}
 
 /// Result when a node crosses its threshold.
 #[derive(Debug, Clone)]
@@ -124,6 +165,24 @@ pub struct ActivationEngine {
     fired_nodes_buffer: [u32; FIRED_BUFFER_CAPACITY],
     /// Number of valid entries in fired_nodes_buffer.
     fired_nodes_count: usize,
+
+    // ── Working Memory Workspace ──
+    /// Stack-allocated ring buffer of the current focus of attention.
+    pub workspace: WorkingMemoryWorkspace,
+
+    // ── Epistemic belief tracking ──
+    /// Confidence level for each StableBelief node (0.0 = no confidence, 1.0 = confirmed).
+    belief_confidence: Vec<f64>,
+    /// Consecutive ticks each StableBelief node has been above threshold.
+    belief_streak: Vec<u8>,
+    /// Cached epistemic status for each node (updated at start of Phase 2).
+    /// Used by Phase 3 spread to gate TransientObservation→CoreConcept and
+    /// StableBelief→CoreConcept energy propagation without graph locks.
+    node_epistemic: Vec<EpistemicStatus>,
+
+    // ── Counterfactual simulation mode ──
+    /// When `Counterfactual`, Phase 4 (STDP) and Phase 5 (valence) are short-circuited.
+    pub cognitive_mode: CognitiveMode,
 }
 
 impl ActivationEngine {
@@ -149,6 +208,11 @@ impl ActivationEngine {
             fired_this_tick: vec![0; words.max(1)],
             fired_nodes_buffer: [0u32; FIRED_BUFFER_CAPACITY],
             fired_nodes_count: 0,
+            workspace: WorkingMemoryWorkspace::new(),
+            belief_confidence: vec![0.0; len],
+            belief_streak: vec![0u8; len],
+            node_epistemic: vec![EpistemicStatus::CoreConcept; len],
+            cognitive_mode: CognitiveMode::Actual,
             ctx,
         }
     }
@@ -219,6 +283,7 @@ impl ActivationEngine {
 
         // ──────────────────────────────────────────────────
         //  Phase 2 — Decay + Injection + Prediction Error
+        //            + Workspace Resonance + Belief Tracking
         // ──────────────────────────────────────────────────
         for i in 1..node_count {
             let node = match graph.get(NodeId::from_raw(i as u64)) {
@@ -227,6 +292,10 @@ impl ActivationEngine {
             };
 
             let mut a = activations[i];
+            let node_epistemic = node.epistemic_status;
+
+            // Cache epistemic status for zero-lock Phase 3 gating
+            self.node_epistemic[i] = node_epistemic;
 
             // Node-specific decay followed by global decay
             a *= node.decay * DECAY_GLOBAL;
@@ -234,9 +303,32 @@ impl ActivationEngine {
             // Add injected energy from external events
             a += self.injection_queue[i];
 
+            // ── Workspace sustained resonance ──
+            // Nodes in the current workspace receive a small energy injection
+            // every tick, preventing them from decaying into silence. This
+            // preserves context across multi-step inference chains.
+            if self.workspace.contains(NodeId::from_raw(i as u64)) {
+                a += WORKSPACE_RESONANCE_INJECT;
+            }
+
             // Floor to prevent noise accumulation
             if a < ACTIVATION_MIN {
                 a = 0.0;
+            }
+
+            // ── Belief confidence tracking ──
+            // StableBelief nodes accumulate confidence when their activation
+            // stays above threshold. Once confirmed for BELIEF_CONFIRMATION_TICKS
+            // consecutive ticks, they can spread to CoreConcept nodes.
+            if node_epistemic == EpistemicStatus::StableBelief {
+                if a > BELIEF_CONFIRMATION_THRESHOLD {
+                    let streak = &mut self.belief_streak[i];
+                    *streak = (*streak + 1).min(BELIEF_CONFIRMATION_TICKS);
+                    self.belief_confidence[i] = *streak as f64 / BELIEF_CONFIRMATION_TICKS as f64;
+                } else {
+                    self.belief_streak[i] = 0;
+                    self.belief_confidence[i] = 0.0;
+                }
             }
 
             // ── Prediction error check (precision-weighted) ──
@@ -369,6 +461,19 @@ impl ActivationEngine {
                     if target_idx >= node_count {
                         continue;
                     }
+                    // Epistemic gate: observations cannot directly activate CoreConcept;
+                    // beliefs need sufficient confidence to propagate to CoreConcept.
+                    if self.node_epistemic[target_idx] == EpistemicStatus::CoreConcept {
+                        let src_epi = self.node_epistemic[i];
+                        if src_epi == EpistemicStatus::TransientObservation {
+                            continue;
+                        }
+                        if src_epi == EpistemicStatus::StableBelief
+                            && self.belief_confidence[i] < BELIEF_CONFIRMATION_THRESHOLD
+                        {
+                            continue;
+                        }
+                    }
                     let spread_energy = remaining * edge.effective_weight() * SPREAD_RATE;
                     activations[target_idx] += spread_energy;
                     remaining -= spread_energy;
@@ -380,6 +485,19 @@ impl ActivationEngine {
                     let target_idx = edge.target.0 as usize;
                     if target_idx >= node_count {
                         continue;
+                    }
+                    // Epistemic gate: observations cannot directly activate CoreConcept;
+                    // beliefs need sufficient confidence to propagate to CoreConcept.
+                    if self.node_epistemic[target_idx] == EpistemicStatus::CoreConcept {
+                        let src_epi = self.node_epistemic[i];
+                        if src_epi == EpistemicStatus::TransientObservation {
+                            continue;
+                        }
+                        if src_epi == EpistemicStatus::StableBelief
+                            && self.belief_confidence[i] < BELIEF_CONFIRMATION_THRESHOLD
+                        {
+                            continue;
+                        }
                     }
                     let spread_energy = a_i * edge.effective_weight() * SPREAD_RATE;
                     activations[target_idx] += spread_energy;
@@ -403,6 +521,14 @@ impl ActivationEngine {
         // ──────────────────────────────────────────────────
         //  Phase 4 — Event-driven STDP + pruning
         // ──────────────────────────────────────────────────
+        //
+        //  In Counterfactual mode, STDP is short-circuited — no weight changes
+        //  are applied. This allows the system to simulate "what if" scenarios
+        //  without altering long-term memory.
+        if self.cognitive_mode == CognitiveMode::Counterfactual {
+            self.fired_nodes_count = 0;
+            // Skip Phase 4 entirely — no STDP during counterfactual simulation.
+        } else {
         //
         //  Instead of iterating all edges (O(N+E) global), we use
         //  the FiredNodesBuffer to process only edges incident to
@@ -431,6 +557,12 @@ impl ActivationEngine {
             };
 
             for (edge_idx, edge) in node.edges.iter_mut().enumerate() {
+                // Skip TransientWorkspace edges — they are ephemeral associations
+                // that should not undergo STDP or be consolidated.
+                if edge.contract == InvariantContract::TransientWorkspace {
+                    continue;
+                }
+
                 // Eligibility decay
                 edge.eligibility *= ELIGIBILITY_DECAY;
 
@@ -505,6 +637,8 @@ impl ActivationEngine {
             }
         }
 
+        } // end else (STDP active)
+
         // Reset FiredNodesBuffer for next tick
         self.fired_nodes_count = 0;
 
@@ -512,11 +646,18 @@ impl ActivationEngine {
         //  Phase 5 — Valence update (preference formation)
         // ──────────────────────────────────────────────────
         //
+        //  In Counterfactual mode, valence is NOT updated — no preferences
+        //  are altered during "what if" simulation.
+        //
         //  Nodes that fire without prediction error → positive valence (familiar = good).
         //  Nodes involved in prediction errors → negative valence (surprise = aversive).
         //  SELF drifts slowly upward (baseline contentment).
         //  Over time, this creates genuine preferences — the system "likes" what it
         //  can predict and "dislikes" what surprises it.
+
+        if self.cognitive_mode == CognitiveMode::Counterfactual {
+            // Skip Phase 5 entirely — no valence changes during counterfactual simulation.
+        } else {
 
         let reward_level = self.modulators.reward;
 
@@ -553,6 +694,8 @@ impl ActivationEngine {
 
         // SELF baseline: slow drift toward positive
         graph.update_valence(NodeId::SELF, 0.5, 0.001);
+
+        } // end else (valence update active)
 
         // ── Phase 6 — Structural verification ──
         let fired_chain: Vec<NodeId> = self.fired.iter().map(|f| f.node_id).collect();
@@ -734,6 +877,50 @@ impl ActivationEngine {
         (self.modulators.novelty, self.modulators.arousal, self.modulators.reward)
     }
 
+    // ── Working Memory Workspace ────────────────────────
+
+    /// Push a node into the working memory workspace.
+    /// Nodes in the workspace receive sustained resonance injection.
+    pub fn push_workspace(&mut self, id: NodeId) {
+        self.workspace.push(id);
+    }
+
+    /// Clear the working memory workspace.
+    pub fn clear_workspace(&mut self) {
+        self.workspace.clear();
+    }
+
+    /// Check if a node is currently in the workspace.
+    pub fn in_workspace(&self, id: NodeId) -> bool {
+        self.workspace.contains(id)
+    }
+
+    /// Create an edge between two workspace nodes marked TransientWorkspace.
+    /// These edges are ephemeral — they bypass STDP and are dropped during
+    /// consolidation.
+    pub fn link_workspace(&mut self, source: NodeId, target: NodeId, relation: Relation) {
+        self.ctx.graph.link_workspace_edge(source, target, relation);
+    }
+
+    /// Returns current workspace nodes as a slice.
+    pub fn workspace_snapshot(&self) -> &[NodeId] {
+        &self.workspace.slots[..self.workspace.count]
+    }
+
+    // ── Cognitive Mode ──────────────────────────────────
+
+    /// Set the cognitive mode (Actual or Counterfactual).
+    /// In Counterfactual mode, Phase 4 (STDP) and Phase 5 (valence) are
+    /// short-circuited, allowing "what if" simulation without long-term effects.
+    pub fn set_mode(&mut self, mode: CognitiveMode) {
+        self.cognitive_mode = mode;
+    }
+
+    /// Get the current cognitive mode.
+    pub fn mode(&self) -> CognitiveMode {
+        self.cognitive_mode
+    }
+
     // ── Render feedback loop ─────────────────────────────
 
     /// Process render feedback: compare actual render state hash against
@@ -810,6 +997,7 @@ mod tests {
             threshold: 2.0,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(2))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -824,6 +1012,7 @@ mod tests {
             threshold: 1.5,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -840,6 +1029,7 @@ mod tests {
             threshold: 1.0,
             base_activation: 0.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -912,6 +1102,7 @@ mod tests {
             threshold: 0.5,
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(3))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -925,6 +1116,7 @@ mod tests {
             threshold: 1.5,
             base_activation: 0.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -988,6 +1180,7 @@ mod tests {
             threshold: 5.0,  // high threshold
             base_activation: 0.0,
             edges: Vec::new(),
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,

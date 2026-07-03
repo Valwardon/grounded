@@ -9,6 +9,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 parking_lot = { workspace = true }
 cognitive-core = { path = "../cognitive-core" }
+metacognition = { path = "../metacognition" }
 semantic-graph = { path = "../semantic-graph" }
 wgpu = { version = "22", optional = true }
 

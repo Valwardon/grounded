@@ -190,6 +190,31 @@ When neuromodulator levels are low (novelty < 0.1, arousal < 0.1) and 1000 ticks
 - **Linear chain compression** — A→B→C where B is a pass-through node (indegree=1, outdegree=1) becomes direct edge A→C with combined weight
 - **Autonomous category synthesis** — clusters nodes sharing ≥80% edge signature overlap into a parent `Concept_Cluster` node with `IsA` edges. Creates abstract categories without external supervision.
 
+### Self-Healing Metacognition
+
+When the engine detects that one of its own cognitive modules is underperforming — a parser that's too slow, a scheduler with too many failures — it can rewrite itself. The _metacognition_ crate implements a 5-phase deterministic pipeline that runs during the same idle consolidation window (novelty < 0.1, arousal < 0.1):
+
+```
+Idle tick → DeficiencyScanner.scan()
+  ↕ constraint violated ≥5 consecutive ticks?
+  Yes → pick most severe deficiency
+  Phase 1 — Generate: translate deficiency into a CandidateModule DSL patch
+  Phase 2 — Verify: validate type signatures against the targeted trait bound
+  Phase 3 — Regression Test: run standard test inputs through the candidate
+  Phase 4 — Benchmark: compare stock vs candidate on a sample loop
+  Phase 5 — Hot-Swap: if ≥5% faster with >95% success rate, atomically flip the
+            double-buffer SwapSlot → remedy node recorded in graph
+```
+
+**Three engine layers** enforced by trait + visibility boundaries:
+- **Layer 0** (Physics) — immutable, no swap slot
+- **Layer 1** (Cognitive Modules) — `CognitiveParser`, `FrameMatcher`, `CuriosityScheduler`, `GapDetectorModule` — self-healing via `SwapSlot<dyn Trait>`
+- **Layer 2** (Strategies) — `ExplorationPolicy`, `InferenceOrder` — fully replaceable
+
+The candidate patch is expressed as **DSL bytecode** (18 safe opcodes, `#![no_std]`-compatible, `[f64; 16]` fixed stack, 256-byte state buffer) and compiled by a `DslCompiler` that validates termination and bounds. Hot-swaps use a `SwapSlot<T>` lock-free double buffer with `AtomicU64` generation counter — readers never block.
+
+When the DeficiencyScanner reports a persistent constraint violation, the **metacognitive curiosity divert** routes budget inward: `E_consume = 0.3·dist(SELF, concept) + 0.4·arousal + 0.2·error_rate + 0.1·deficiency_severity`. At severity > 0.3, at least 30% of the curiosity budget goes to internal optimization instead of external exploration.
+
 ### The Self Node
 
 Node index 1 is always `SELF` — the engine's persistent "I". Pre-inserted with base activation 1.0 and decay 1.0, it never fades. Every experience attaches here:
@@ -402,11 +427,12 @@ After every tick's valence update:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode (valence, **mean_error**, **variance**), GraphArena (**path_cache**: 16-slot `CachedPath` with interior mutability), ActivationBuffer, Edge (STDP, contract), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 10 Relation types, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives, **VisualPrimitiveType** (6 visual primitive variants), **Grounding::VisualPrimitive**, **FixedVisualPayload** (6 f64 fields), **VisualPrimitiveRingBuffer** (lock-free SPSC, 64 slots) |
+| `semantic-graph` | GroundedNode (valence, **mean_error**, **variance**, **epistemic_status**), GraphArena (**path_cache**: 16-slot `CachedPath` with interior mutability, **link_workspace()**, **garbage_collect_transient_edges()**), ActivationBuffer, Edge (STDP, contract, **TransientWorkspace**), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 12 Relation types (added **SupportsBelief**), 3 **EpistemicStatus** variants + **CognitiveMode** enum, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives, **VisualPrimitiveType** (6 visual primitive variants), **Grounding::VisualPrimitive**, **FixedVisualPayload** (6 f64 fields), **VisualPrimitiveRingBuffer** (lock-free SPSC, 64 slots) |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer, **CCG RelationalParser** (shift-reduce, semantic categories, 7 reduction rules, proximity fallback) |
-| `cognitive-core` | ActivationEngine (6-phase tick: **precision-weighted prediction error**, **sparse spread** with TRIM=64, **event-driven STDP** via `FiredNodesBuffer [u32; 1024]`), VerificationLoop, CognitiveDaemon, **RenderCommand/RenderPrediction feedback loop**, Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), EventChannel, Consolidation (**synthesize_categories()**) |
-| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge, **RenderBridge** (OS thread, dual buffer + ring polling, RenderBackend trait, Null/Wgpu backends), **PenalizeFn** (–0.05 valence on validate_ast() error) |
+| `cognitive-core` | ActivationEngine (6-phase tick: **precision-weighted prediction error**, **workspace resonance**, **epistemic gating**, **belief confidence tracking**, **sparse spread** with TRIM=64, **event-driven STDP** via `FiredNodesBuffer [u32; 1024]`, **counterfactual short-circuit**), VerificationLoop, CognitiveDaemon (**set_cognitive_mode()**, **set_self_healing_hook()**, runs `SelfHealingHook` during idle consolidation), **WorkingMemoryWorkspace** (`[NodeId; 12]`, resonance +0.15), **RenderCommand/RenderPrediction feedback loop** (+**render_target: CognitiveMode**), Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), EventChannel, Consolidation (**synthesize_categories()** v2: edge-signature + **predictive-role abstraction** with 2-hop profile clustering) |
+| `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge, creates `ModuleRegistry` + `SelfHealingPipeline` with default constraints, attaches to daemon via `set_self_healing_hook()`, **RenderBridge** (OS thread, dual buffer + ring polling, RenderBackend trait, Null/Wgpu backends), **PenalizeFn** (–0.05 valence on validate_ast() error) |
 | `curiosity-core` | Gap detection, **CCG-based DefinitionResolver**, async harvester, **CuriosityBudget** (energy-aware, replaces depth 10) |
+| `metacognition` | **Self-healing pipeline**: `DeficiencyScanner` (constraint violation detection), `CandidateModule` DSL (18 safe opcodes, bytecode interpreter), `SwapSlot` lock-free double-buffer hot-swap, 5-phase `SelfHealingPipeline` (Generation → Contract Verification → Regression Testing → Ecological Benchmarking → Hot-Swap), `MetacognitiveCuriosity` (internal budget routing) |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json, **effector math** (GravityVector, PaletteInterpolator, SkeletalTransformMatrix), **TransformEngine** (sensor→effector) |
 | `uniffi-exports` | 18-function UniFFI surface for Kotlin |
 
@@ -446,6 +472,11 @@ After every tick's valence update:
 - [x] **Event-driven STDP**: FiredNodesBuffer [u32; 1024], incident-only edge processing in Phase 4 (O(F·avg_degree) instead of O(N+E))
 - [x] **Incremental path cache**: 16-slot `CachedPath` cache in GraphArena with interior mutability, invalidated on structural mutation
 - [x] **Autonomous category synthesis**: isomorphism scanner during consolidation, ≥80% edge signature overlap → Concept_Cluster parent with IsA edges
+- [x] **Epistemic node separation**: three-tier `TransientObservation → StableBelief → CoreConcept` with belief confidence tracking and Phase 3 spread gating
+- [x] **Working memory workspace**: `[NodeId; 12]` stack-allocated attention buffer, `+0.15` resonance injection, `TransientWorkspace` contract edges (skipped in STDP and consolidation)
+- [x] **Counterfactual simulation mode**: `CognitiveMode::Counterfactual` short-circuits Phase 4 (STDP) and Phase 5 (valence), `RenderCommand.render_target` routes to ImaginationBuffer
+- [x] **Predictive-role abstraction**: two-pass category synthesis (edge-signature + 2-hop predictive profile clustering at 70% overlap, terminal node extraction)
+- [x] **Self-healing metacognition**: DeficiencyScanner + 5-phase pipeline + DSL bytecode (18 opcodes) + SwapSlot lock-free hot-swap + metacognitive curiosity divert
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
 

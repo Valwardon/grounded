@@ -66,6 +66,7 @@ const SIGNATURE_MAX_EDGES: usize = 32;
 /// isomorphism comparison.
 fn extract_edge_signature(node: &GroundedNode) -> (Vec<(u8, u64)>, u64) {
     let mut pairs: Vec<(u8, u64)> = node.edges.iter()
+        .filter(|e| e.effective_contract() != InvariantContract::TransientWorkspace)
         .take(SIGNATURE_MAX_EDGES)
         .map(|e| (e.relation as u8, e.target.0))
         .collect();
@@ -104,17 +105,29 @@ fn signature_overlap(a: &[(u8, u64)], b: &[(u8, u64)]) -> f64 {
 
 /// Scan the graph for isomorphic node clusters and hoist abstract categories.
 ///
-/// For each pair of nodes with high signature overlap, group them.
-/// When a cluster of 3+ nodes with ≥80% overlap is found, create a
-/// new parent concept node, migrate shared edges, and anchor children.
+/// Two-pass synthesis:
+///   Pass 1 — Edge-signature clustering (existing): clusters nodes with ≥80%
+///             shared outbound edge patterns.
+///   Pass 2 — Predictive-role clustering (new): clusters nodes with ≥70%
+///             overlap in their 2-hop predictive profiles (terminal primitives,
+///             motor commands, sensors). Nodes already assigned in Pass 1
+///             are skipped.
+///
+/// When a cluster of 3+ nodes is found, a parent concept is created with
+/// shared edges and children are anchored via IsA.
 fn synthesize_categories(graph: &mut GraphArena) -> usize {
     let node_count = graph.len();
     if node_count < 4 {
         return 0; // need at least 3 candidates + room for parent
     }
 
+    let mut categories_synthesized = 0;
+    let mut assigned_global: HashSet<u64> = HashSet::new();
+
+    // ── Pass 1: Edge-signature clustering ──
+
     // Collect signatures for all non-dead concept nodes
-    let mut signatures: Vec<(u64, u64, Vec<(u8, u64)>)> = Vec::new(); // (index, hash, pairs)
+    let mut signatures: Vec<(u64, u64, Vec<(u8, u64)>)> = Vec::new();
     for i in 2..node_count {
         let node = graph.get(NodeId::from_raw(i as u64));
         if let Some(n) = node {
@@ -130,54 +143,117 @@ fn synthesize_categories(graph: &mut GraphArena) -> usize {
         }
     }
 
-    if signatures.len() < ISOMORPHISM_CLUSTER_SIZE {
-        return 0;
-    }
+    if signatures.len() >= ISOMORPHISM_CLUSTER_SIZE {
+        // Cluster by pairwise signature overlap
+        let mut clustered: Vec<Vec<u64>> = Vec::new();
+        let mut assigned: HashSet<u64> = HashSet::new();
 
-    // Cluster by pairwise signature overlap
-    let mut clustered: Vec<Vec<u64>> = Vec::new();
-    let mut assigned: HashSet<u64> = HashSet::new();
-
-    for i in 0..signatures.len() {
-        let (id_i, _, ref pairs_i) = signatures[i];
-        if assigned.contains(&id_i) {
-            continue;
-        }
-        let mut cluster = vec![id_i];
-        assigned.insert(id_i);
-
-        for j in (i + 1)..signatures.len() {
-            let (id_j, _, ref pairs_j) = signatures[j];
-            if assigned.contains(&id_j) {
+        for i in 0..signatures.len() {
+            let (id_i, _, ref pairs_i) = signatures[i];
+            if assigned.contains(&id_i) {
                 continue;
             }
-            let overlap = signature_overlap(pairs_i, pairs_j);
-            if overlap >= ISOMORPHISM_OVERLAP_THRESHOLD {
-                cluster.push(id_j);
-                assigned.insert(id_j);
+            let mut cluster = vec![id_i];
+            assigned.insert(id_i);
+
+            for j in (i + 1)..signatures.len() {
+                let (id_j, _, ref pairs_j) = signatures[j];
+                if assigned.contains(&id_j) {
+                    continue;
+                }
+                let overlap = signature_overlap(pairs_i, pairs_j);
+                if overlap >= ISOMORPHISM_OVERLAP_THRESHOLD {
+                    cluster.push(id_j);
+                    assigned.insert(id_j);
+                }
+            }
+
+            if cluster.len() >= ISOMORPHISM_CLUSTER_SIZE {
+                clustered.push(cluster);
             }
         }
 
-        if cluster.len() >= ISOMORPHISM_CLUSTER_SIZE {
-            clustered.push(cluster);
+        // Hoist edge-signature clusters
+        categories_synthesized += hoist_clusters(graph, &clustered, "Sig");
+        assigned_global.extend(assigned);
+    }
+
+    // ── Pass 2: Predictive-role clustering ──
+    // Cluster remaining concept nodes by shared 2-hop predictive profile.
+
+    let mut predictive_candidates: Vec<(u64, HashSet<u64>)> = Vec::new(); // (id, profile)
+    for i in 2..node_count {
+        let id = i as u64;
+        if assigned_global.contains(&id) {
+            continue;
+        }
+        let node = graph.get(NodeId::from_raw(id));
+        if let Some(n) = node {
+            let guard = n.read();
+            if guard.node_type != NodeType::Concept || guard.edges.is_empty() {
+                continue;
+            }
+            if guard.threshold >= f64::MAX {
+                continue;
+            }
+            let profile = predictive_profile(NodeId::from_raw(id), graph);
+            if !profile.is_empty() {
+                predictive_candidates.push((id, profile));
+            }
         }
     }
 
-    // Hoist each cluster → create parent node, migrate edges
-    let mut categories_synthesized = 0;
+    if predictive_candidates.len() >= ISOMORPHISM_CLUSTER_SIZE {
+        let mut pred_clusters: Vec<Vec<u64>> = Vec::new();
+        let mut pred_assigned: HashSet<u64> = HashSet::new();
 
-    for cluster in &clustered {
-        // Gather the child node labels for naming
-        let labels: Vec<String> = cluster.iter()
-            .filter_map(|id| graph.label_of(NodeId::from_raw(*id)))
-            .collect();
+        for i in 0..predictive_candidates.len() {
+            let (id_i, ref profile_i) = predictive_candidates[i];
+            if pred_assigned.contains(&id_i) {
+                continue;
+            }
+            let mut cluster = vec![id_i];
+            pred_assigned.insert(id_i);
 
+            for j in (i + 1)..predictive_candidates.len() {
+                let (id_j, ref profile_j) = predictive_candidates[j];
+                if pred_assigned.contains(&id_j) {
+                    continue;
+                }
+                let overlap = predictive_overlap(profile_i, profile_j);
+                if overlap >= PREDICTIVE_OVERLAP_THRESHOLD {
+                    cluster.push(id_j);
+                    pred_assigned.insert(id_j);
+                }
+            }
+
+            if cluster.len() >= ISOMORPHISM_CLUSTER_SIZE {
+                pred_clusters.push(cluster);
+            }
+        }
+
+        // Hoist predictive-role clusters
+        categories_synthesized += hoist_clusters(graph, &pred_clusters, "PredRole");
+    }
+
+    categories_synthesized
+}
+
+/// Hoist a set of clusters into parent concept nodes.
+/// Each cluster's parent captures shared edges across all children.
+fn hoist_clusters(graph: &mut GraphArena, clusters: &[Vec<u64>], label_prefix: &str) -> usize {
+    let mut total = 0;
+
+    for cluster in clusters {
         // Find overlapping edges across all children
         let mut edge_intersection: Vec<(Relation, NodeId, f64)> = {
             let first = cluster[0];
             let node = graph.get(NodeId::from_raw(first)).unwrap();
             let guard = node.read();
-            guard.edges.iter().map(|e| (e.relation, e.target, e.effective_weight())).collect()
+            guard.edges.iter()
+                .filter(|e| e.effective_contract() != InvariantContract::TransientWorkspace)
+                .map(|e| (e.relation, e.target, e.effective_weight()))
+                .collect()
         };
 
         for &child_id in &cluster[1..] {
@@ -193,7 +269,7 @@ fn synthesize_categories(graph: &mut GraphArena) -> usize {
         }
 
         // Create parent node
-        let parent_label = format!("Concept_Cluster_{:X}", cluster[0]);
+        let parent_label = format!("{}_{:X}", label_prefix, cluster[0]);
         let avg_valence: f64 = cluster.iter()
             .filter_map(|id| graph.get_valence(NodeId::from_raw(*id)))
             .sum::<f64>() / cluster.len() as f64;
@@ -211,6 +287,7 @@ fn synthesize_categories(graph: &mut GraphArena) -> usize {
             threshold: 1.2,
             base_activation: 0.0,
             edges: parent_edges,
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: avg_valence,
             mean_error: 0.0,
             variance: 0.0,
@@ -228,23 +305,16 @@ fn synthesize_categories(graph: &mut GraphArena) -> usize {
             }
         }
 
-        categories_synthesized += 1;
+        total += 1;
     }
 
-    categories_synthesized
+    total
 }
 
-/// Remove edges that have been marked for pruning (|weight| < PRUNE_THRESHOLD).
-/// Returns count of removed edges.
 fn garbage_collect_edges(graph: &mut GraphArena) -> usize {
-    // Access the nodes directly for mutation
-    // We need to do this without the public API since GraphArena doesn't expose
-    // raw node access. For now, this is a placeholder that delegates to the
-    // existing garbage_collect_edges on GraphArena.
-    let before = graph.len();
+    let pruned_count = graph.garbage_collect_transient_edges();
     graph.garbage_collect_edges();
-    // Return diff — approximate, since garbage_collect_edges doesn't return count
-    0
+    pruned_count
 }
 
 /// Find linear chains (A→B→C where B has indegree=1, outdegree=1)
@@ -262,8 +332,11 @@ fn compress_linear_chains(graph: &mut GraphArena) -> (usize, usize) {
             Some(n) => n.read(),
             None => continue,
         };
-        outdegree[i] = node.edges.len() as u32;
+        outdegree[i] = node.edges.iter().filter(|e| e.effective_contract() != InvariantContract::TransientWorkspace).count() as u32;
         for edge in &node.edges {
+            if edge.effective_contract() == InvariantContract::TransientWorkspace {
+                continue;
+            }
             let t = edge.target.0 as usize;
             if t < node_count {
                 indegree[t] += 1;
@@ -359,6 +432,82 @@ fn estimate_chain_weight(graph: &GraphArena, source: usize, mid: usize, target: 
     (w1 * w2).clamp(-1.0, 1.0)
 }
 
+// ────────────────────────────────────────────────────────────
+//  Predictive-Role Abstraction (category synthesis v2)
+// ────────────────────────────────────────────────────────────
+
+/// Maximum nodes to visit during 2-hop predictive profile extraction.
+const PROFILE_MAX_NODES: usize = 128;
+
+/// Minimum predictive overlap ratio for two nodes to be considered
+/// predictively related (used for category synthesis v2).
+const PREDICTIVE_OVERLAP_THRESHOLD: f64 = 0.70;
+
+/// Extract the 2-hop predictive profile of a node.
+///
+/// Walks edges up to 2 hops from the given node and collects all terminal
+/// nodes (VisualPrimitive, MotorCommand, Sensor groundings). Terminal nodes
+/// represent the "effect" or "output" side of the concept — what sensorimotor
+/// consequences the concept predicts.
+///
+/// Uses a visited set bounded by PROFILE_MAX_NODES to prevent infinite
+/// traversal in cyclic graphs. TransientWorkspace edges are skipped.
+fn predictive_profile(node_id: NodeId, graph: &GraphArena) -> HashSet<u64> {
+    let mut terminals: HashSet<u64> = HashSet::new();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut frontier: Vec<u64> = vec![node_id.0];
+    let mut hops_remaining = 2;
+
+    while hops_remaining > 0 && !frontier.is_empty() && visited.len() < PROFILE_MAX_NODES {
+        let mut next_frontier: Vec<u64> = Vec::new();
+        for &current_id in &frontier {
+            if !visited.insert(current_id) {
+                continue;
+            }
+            let node = graph.get(NodeId::from_raw(current_id));
+            if let Some(n) = node {
+                let guard = n.read();
+                match guard.grounding {
+                    Grounding::VisualPrimitive { .. }
+                    | Grounding::MotorCommand { .. }
+                    | Grounding::Sensor { .. } => {
+                        terminals.insert(current_id);
+                        continue;
+                    }
+                    _ => {}
+                }
+                for edge in &guard.edges {
+                    if edge.effective_contract() == InvariantContract::TransientWorkspace {
+                        continue;
+                    }
+                    let tid = edge.target.0;
+                    if !visited.contains(&tid) {
+                        next_frontier.push(tid);
+                    }
+                }
+            }
+        }
+        frontier = next_frontier;
+        hops_remaining -= 1;
+    }
+
+    terminals
+}
+
+/// Compute Jaccard overlap ratio between two predictive profiles.
+fn predictive_overlap(a: &HashSet<u64>, b: &HashSet<u64>) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let intersection = a.intersection(b).count();
+    let union = a.union(b).count();
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,6 +524,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -386,6 +536,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(4))],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,
@@ -397,6 +548,7 @@ mod tests {
             grounding: Grounding::Abstract,
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![],
+            epistemic_status: EpistemicStatus::CoreConcept,
             valence: 0.0,
             mean_error: 0.0,
             variance: 0.0,

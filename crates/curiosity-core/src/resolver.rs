@@ -65,6 +65,7 @@ impl DefinitionResolver {
                     threshold: 10.0,
                     base_activation: 0.0,
                     edges: Vec::with_capacity(parse.relations.len()),
+                    epistemic_status: EpistemicStatus::CoreConcept,
                     valence: 0.0,
                     mean_error: 0.0,
                     variance: 0.0,
