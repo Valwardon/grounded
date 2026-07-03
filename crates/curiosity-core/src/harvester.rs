@@ -316,6 +316,8 @@ mod tests {
             base_activation: 0.0,
             edges: Vec::new(),
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         let ctx = SemanticContext::new(g);
         let mut harvester = AutonomousHarvester::new(ctx.clone());

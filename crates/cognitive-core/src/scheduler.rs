@@ -563,6 +563,8 @@ impl CognitiveDaemon {
                         base_activation: cmd.get("base").and_then(|v| v.as_f64()).unwrap_or(0.0),
                         edges: Vec::new(),
                         valence: 0.0,
+                        mean_error: 0.0,
+                        variance: 0.0,
                     };
                     graph.insert(node);
                 }

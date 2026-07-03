@@ -335,6 +335,20 @@ pub struct GroundedNode {
     /// Drives preference formation — the system forms "likes" and "dislikes"
     /// deterministically from its own prediction history.
     pub valence: f64,
+
+    /// Precision-weighted predictive coding fields.
+    ///
+    /// `mean_error`: Exponential moving average of prediction error for this node.
+    /// Updated each tick when a prediction exists: mean_error += 0.05 * (raw_error - mean_error).
+    /// Starts at 0.0 (no history).
+    ///
+    /// `variance`: Exponential moving variance of activation patterns.
+    /// Updated each tick: variance += 0.05 * ((actual - expected)^2 - variance).
+    /// Used to compute node precision: precision = 1.0 / (variance + 0.001).
+    /// High-variance nodes (inherent noise) naturally self-attenuate their prediction
+    /// error signals, preventing runaway curiosity loops from noisy sensors.
+    pub mean_error: f64,
+    pub variance: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -419,9 +433,26 @@ pub trait SemanticRelation: Send + Sync {
 //  Arena-backed graph store
 // ────────────────────────────────────────────────────────────
 
+/// A cached path result used to short-circuit BFS/verification.
+#[derive(Debug, Clone)]
+pub struct CachedPath {
+    pub source: NodeId,
+    pub destination: NodeId,
+    /// Relation bitmask: bit 0 = IsA, bit 1 = HasProperty, etc.
+    pub relation_mask: u64,
+    /// Total path weight (product of edge weights).
+    pub path_weight: f64,
+}
+
 pub struct GraphArena {
     nodes: Vec<parking_lot::RwLock<GroundedNode>>,
     label_index: Vec<(String, NodeId)>,
+
+    // ── Incremental path cache ──
+    /// Fixed-size cache of verified paths, wrapped in a mutex for
+    /// interior mutability (verify_path/find_path are &self).
+    /// Invalidated (cleared) on any structural change.
+    path_cache: parking_lot::Mutex<[Option<CachedPath>; 16]>,
 }
 
 impl GraphArena {
@@ -429,6 +460,7 @@ impl GraphArena {
         let mut arena = GraphArena {
             nodes: Vec::with_capacity(cap),
             label_index: Vec::with_capacity(cap),
+            path_cache: parking_lot::Mutex::new(Default::default()),
         };
         // Index 0: null sentinel
         arena.nodes.push(parking_lot::RwLock::new(GroundedNode {
@@ -441,6 +473,8 @@ impl GraphArena {
             base_activation: 0.0,
             edges: Vec::new(),
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         }));
         // Index 1: the persistent self — every experience anchors here
         arena.nodes.push(parking_lot::RwLock::new(GroundedNode {
@@ -453,6 +487,8 @@ impl GraphArena {
             base_activation: 1.0,
             edges: Vec::new(),
             valence: 0.5,
+            mean_error: 0.0,
+            variance: 0.0,
         }));
         arena.label_index.push(("self".to_string(), NodeId::SELF));
         arena
@@ -462,6 +498,7 @@ impl GraphArena {
         let id = NodeId::from_raw(self.nodes.len() as u64);
         self.label_index.push((node.label.clone(), id));
         self.nodes.push(parking_lot::RwLock::new(node));
+        self.path_cache.lock().fill(None);
         id
     }
 
@@ -483,9 +520,12 @@ impl GraphArena {
                 base_activation: 0.0,
                 edges: Vec::new(),
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }));
         }
         self.nodes[idx] = parking_lot::RwLock::new(node);
+        self.path_cache.lock().fill(None);
         id
     }
 
@@ -532,6 +572,7 @@ impl GraphArena {
             return false;
         }
         self.nodes[self_idx].write().edges.push(Edge::new(relation, target));
+        self.path_cache.lock().fill(None);
         true
     }
 
@@ -603,6 +644,29 @@ impl GraphArena {
             let mut node = node_lock.write();
             node.edges.retain(|e| e.dynamic_weight.abs() >= PRUNE_THRESHOLD);
         }
+        self.path_cache.lock().fill(None);
+    }
+
+    // ── Incremental path cache ─────────────────────────────
+    /// Check if (source, dest) has been verified as a valid path.
+    fn cache_hit(&self, source: NodeId, dest: NodeId) -> bool {
+        let cache = self.path_cache.lock();
+        cache.iter().any(|slot| matches!(slot, Some(cp) if cp.source == source && cp.destination == dest))
+    }
+
+    /// Store a path result in the cache (simple evict-random on full).
+    fn cache_store(&self, source: NodeId, dest: NodeId, relation_mask: u64, path_weight: f64) {
+        let mut cache = self.path_cache.lock();
+        let entry = CachedPath { source, destination: dest, relation_mask, path_weight };
+        for slot in cache.iter_mut() {
+            if slot.is_none() {
+                *slot = Some(entry);
+                return;
+            }
+        }
+        // Cache full — replace a random slot
+        let idx = (source.0.wrapping_mul(2654435761) as usize) % cache.len();
+        cache[idx] = Some(entry);
     }
 
     // ── Structural path verification ──────────────────────
@@ -622,6 +686,15 @@ impl GraphArena {
     pub fn verify_path(&self, path: &[NodeId]) -> Result<(), StructuralError> {
         if path.len() < 2 {
             return Ok(()); // single-node paths are trivially valid
+        }
+
+        let source = path[0];
+        let dest = path[path.len() - 1];
+
+        // Short-circuit: if this (source, dest) pair was already verified,
+        // skip the full traversal.
+        if self.cache_hit(source, dest) {
+            return Ok(());
         }
 
         // Check for duplicate nodes (cycles)
@@ -699,6 +772,8 @@ impl GraphArena {
             }
         }
 
+        // Cache the successful verification
+        self.cache_store(source, dest, 0, 1.0);
         Ok(())
     }
 

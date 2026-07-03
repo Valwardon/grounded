@@ -321,6 +321,8 @@ impl CognitiveLifecycle {
                 grounding: Grounding::Sensor { sensor_type: sensor_type.into(), channel, norm },
                 decay, threshold, base_activation: 0.0, edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(target))],
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }
         }
 
@@ -329,6 +331,8 @@ impl CognitiveLifecycle {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::Concept,
                 grounding: Grounding::Abstract, decay, threshold, base_activation: 0.0, edges,
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }
         }
 
@@ -338,6 +342,8 @@ impl CognitiveLifecycle {
                 grounding: Grounding::Action { intent_template: intent_template.into() },
                 decay, threshold, base_activation: 0.0, edges: Vec::new(),
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }
         }
 
@@ -347,6 +353,8 @@ impl CognitiveLifecycle {
                 grounding: Grounding::VisualPrimitive { primitive_type },
                 decay: 0.95, threshold, base_activation: 0.0, edges,
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }
         }
 
@@ -356,6 +364,8 @@ impl CognitiveLifecycle {
                 grounding: Grounding::Stored { keyspace: keyspace.into(), key: key.into() },
                 decay, threshold: f64::MAX, base_activation: 0.0, edges,
                 valence: 0.0,
+                mean_error: 0.0,
+                variance: 0.0,
             }
         }
 

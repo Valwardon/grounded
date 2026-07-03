@@ -184,6 +184,8 @@ mod tests {
             decay: 0.9, threshold: 2.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(CONCEPT_ID))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         g.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -193,6 +195,8 @@ mod tests {
             decay: 0.9, threshold: 1.5, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(ACTION_ID))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         g.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -204,6 +208,8 @@ mod tests {
             decay: 0.5, threshold: 1.0, base_activation: 0.0,
             edges: vec![],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         g
     }

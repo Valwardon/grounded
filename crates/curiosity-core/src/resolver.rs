@@ -66,6 +66,8 @@ impl DefinitionResolver {
                     base_activation: 0.0,
                     edges: Vec::with_capacity(parse.relations.len()),
                     valence: 0.0,
+                    mean_error: 0.0,
+                    variance: 0.0,
                 });
                 id
             }
@@ -96,6 +98,8 @@ impl DefinitionResolver {
                         base_activation: 0.0,
                         edges: Vec::new(),
                         valence: 0.0,
+                        mean_error: 0.0,
+                        variance: 0.0,
                     });
                     if !dependencies.contains(&target.to_lowercase()) {
                         dependencies.push(target.to_lowercase());
@@ -121,6 +125,8 @@ impl DefinitionResolver {
                             base_activation: 0.0,
                             edges: Vec::new(),
                             valence: 0.0,
+                            mean_error: 0.0,
+                            variance: 0.0,
                         });
                         if !dependencies.contains(&source.to_lowercase()) {
                             dependencies.push(source.to_lowercase());

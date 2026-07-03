@@ -75,8 +75,8 @@ A non-AI, deterministic cognitive system that runs 100% on-device. No tokens, no
 │                     │  ┌────────────────────────────┐   │     │
 │                     │  │  Verification Core         │   │     │
 │                     │  │  ├─ VerificationLoop       │   │     │
-│                     │  │  ├─ Energy conservation    │   │     │
-│                     │  │  └─ Path integrity         │   │     │
+│                     │  │  ├─ Energy conservation    │  │     │
+│                     │  │  ├─ Path integrity (cached)│  │     │
 │                     │  └────────────────────────────┘   │     │
 │                     └──────────────────────────────────┘     │
 └──────────────────────────────────────────────────────────────┘
@@ -171,26 +171,107 @@ Frames define mandatory relational slots:
 Phase 1 — Neuromodulator Decay (O(1)):
   novelty/arousal/reward leak toward baseline (8%/12%/4%)
 
-Phase 2 — Decay + Injection + Prediction Error (O(N)):
+Phase 2 — Decay + Injection + Precision-Weighted Prediction Error (O(N)):
   activation[i] *= node.decay * 0.97 + injection[i]
-  if |actual - predicted| / predicted > 0.3 → PredictionError → novelty spike
+  if prediction exists:
+    raw_error = |actual - expected| / max(expected, 0.001)
+    precision = clamp(1.0 / (variance + 0.001), 0.1, 10.0)
+    weighted_error = raw_error * precision
+    mean_error += 0.05 * (raw_error - mean_error)
+    variance += 0.05 * ((actual - expected)^2 - variance)
+    if weighted_error > PREDICTION_ERROR_THRESHOLD → novelty spike
 
-Phase 3 — Spread + Eligibility (O(N+E)):
+Phase 3 — Sparse Spread + Firing + Eligibility (O(N+E)):
   if activation > threshold * threshold_mod:
-    fire(i), if MotorCommand → push RenderCommand + prediction
-  else: spread energy to neighbors (conservation)
+    fire(i), push index to FiredNodesBuffer[count++]
+    if MotorCommand → push RenderCommand + prediction
+  else:
+    if edge_count > SPARSE_SPREAD_MAX_EDGES (64):
+      sort edges by dynamic_weight desc, truncate to 64
+    spread energy to neighbors (conservation)
+    terminate when remaining energy < SPARSE_SPREAD_MIN_ENERGY (0.005)
 
-Phase 4 — STDP + Pruning (O(E)):
-  eligibility decay, boost on source fire, LTP on co-fire, LTD drift, prune
+Phase 4 — Event-Driven STDP + Pruning (O(F·avg_degree)):
+  for each fired node i in FiredNodesBuffer:
+    for each edge of i: decay eligibility, LTP/LTD
+    for each pair (i, j) in FiredNodesBuffer (j > i):
+      if (i,j) not in processed_pairs:
+        find edge i→j or j→i, apply LTP/LTD, mark processed
+  clear FiredNodesBuffer (count = 0)
 
 Phase 5 — Valence Update (O(N)):
   fire + error → negative; fire + no error → positive; SELF → +0.5 baseline
 
 Phase 6 — Structural Verification + Visual Push (O(N+E)):
-  energy conservation, path integrity, novelty/valence/edge penalties
+  energy conservation, path integrity (cached: cache_hit short-circuits
+    per-edge contract checks for previously verified (source,dest) pairs),
+    novelty/valence/edge penalties
   compute_effector_state() → VisualEffectorBuffer.write()
   get_active_visual_primitives(activations) → if > VISUAL_CLUSTER_THRESHOLD, VisualPrimitiveRingBuffer.push()
 ```
+
+### Phase 2 Detail: Precision-Weighted Prediction Error
+
+Each `GroundedNode` now carries a running estimate of its own prediction reliability:
+
+| Node Field | Purpose | Update Rule |
+|-----------|---------|-------------|
+| `mean_error` | EMA of absolute prediction error | `+= 0.05 × (raw_error - mean_error)` |
+| `variance` | EMA of squared error | `+= 0.05 × ((actual-expected)² - variance)` |
+| `precision` | Derived (not stored) | `1.0 / (variance + 0.001)`, clamped [0.1, 10.0] |
+
+High-variance nodes (noisy sensors, unpredictable concepts) naturally self-attenuate — their precision term approaches 0.1, reducing effective error by up to 10×. This prevents runaway curiosity loops from sensor jitter.
+
+### Phase 3 Detail: Sparse Spread for High-Degree Nodes
+
+When a node has more than `SPARSE_SPREAD_MAX_EDGES` (64) outbound edges, the spread phase sorts edges by `dynamic_weight` descending and propagates energy only to the top 64. Remaining energy below `SPARSE_SPREAD_MIN_ENERGY` (0.005) is discarded. This prevents hub nodes (e.g. SELF with thousands of edges) from O(E) dominating the tick budget.
+
+### Phase 4 Detail: Event-Driven STDP
+
+Phase 4 no longer iterates all graph edges globally. Instead:
+
+1. Phase 3 populates `FiredNodesBuffer: [u32; 1024]` with indices of firing nodes
+2. Phase 4 processes only edges incident to nodes in the buffer:
+   - For each fired node `i`: iterate its outbound edges, decay eligibility, apply LTP if target also fired
+   - For each unordered pair `(i, j)` with `i < j`: check for bidirectional edges via `processed_pairs: HashSet<(usize, usize)>`
+3. `FiredNodesBuffer` is cleared at end of Phase 4 (`count = 0`)
+
+Complexity reduces from O(N+E) to O(F·avg_degree) where F ≤ 1024 ≪ N.
+
+### Incremental Path Cache (GraphArena)
+
+`verify_path()` now checks a **16-slot path cache** before doing per-edge contract verification:
+
+- **Cache hit**: `(source, dest)` pair found → return `Ok(())` immediately
+- **Cache miss**: verify path, store `CachedPath { source, destination, relation_mask, path_weight }` on success
+- **Invalidation**: any structural mutation (`insert`, `insert_at`, `link_to_self`, `garbage_collect_edges`) sets all slots to `None` via `.fill(None)`
+- **Eviction**: random-slot replacement on full (hash-based: `source.0 * 2654435761 % 16`)
+- **Storage**: `parking_lot::Mutex<[Option<CachedPath>; 16]>` for interior mutability (`verify_path` is `&self`)
+- **`find_path()`** unchanged — still full BFS; cache avoids re-verifying same paths in Phase 6, not path discovery
+
+### Autonomous Category Synthesis (Sleep Consolidation)
+
+During low-activity periods (novelty < 0.1, arousal < 0.1) the consolidation pass runs an **isomorphism scanner** that detects structural clusters:
+
+```
+synthesize_categories():
+  for each node i:
+    signature_i = extract_edge_signature(i)
+      → sorted Vec<(Relation::to_u8(), TargetNodeId)> of outbound edges
+      → capped at SIGNATURE_MAX_EDGES (32)
+  for each pair (i, j):
+    overlap = signature_overlap(signature_i, signature_j)
+      → Jaccard-like ratio on sorted signature tuples
+  if cluster of ≥3 nodes with overlap ≥ 80%:
+    1. Create parent node: label="Concept_Cluster_0x{first_child:X}"
+    2. Compute intersection of all children's edge sets
+    3. Migrate intersecting edges to parent
+    4. Anchor each child with Relation::IsA → parent (weight 1.0)
+    5. Set parent valence = average of children's valence
+    6. categories_synthesized += 1
+```
+
+Parent nodes act as abstract categories — the system autonomously hoists recurring patterns into a superordinate concept without external supervision.
 
 ## Crate Map
 
@@ -202,6 +283,12 @@ Phase 6 — Structural Verification + Visual Push (O(N+E)):
 - `frame_schemas` — 4 built-in: CommercialTransfer, MotionEvent, SensoryEvent, OwnershipChange
 - `MotorCommandType` — 7 effector command types
 - `Grounding::MotorCommand` — motor effector grounding
+- `GroundedNode.mean_error`, `GroundedNode.variance` — EMA prediction statistics for precision-weighting
+- `CachedPath { source, destination, relation_mask, path_weight }` — path cache entry
+- `GraphArena::path_cache: Mutex<[Option<CachedPath>; 16]>` — incremental path cache with interior mutability
+- `GraphArena::cache_hit()`, `cache_store()` — cache lookup/store helpers
+- `GraphArena::verify_path()` — checks cache before per-edge traversal
+- Cache invalidation on `insert`, `insert_at`, `link_to_self`, `garbage_collect_edges`
 
 ### semantic-parser
 - `parse_intent()`, `parse_sensor_event()`, `Realizer`
@@ -214,6 +301,14 @@ Phase 6 — Structural Verification + Visual Push (O(N+E)):
 - `process_render_feedback()` — compares actual hash vs predicted, spikes reward/novelty
 - `VerificationLoop`, `EventChannel`, `CognitiveDaemon`, Consolidation
 - `CognitiveOutput::RenderCommand`, `CognitiveEvent::RenderFeedback`
+- `FiredNodesBuffer: [u32; 1024]` — event-driven STDP tracking, populated Phase 3, consumed Phase 4
+- `SPARSE_SPREAD_MAX_EDGES = 64` — sort+truncate for high-degree node spread
+- `SPARSE_SPREAD_MIN_ENERGY = 0.005` — early termination threshold in spread
+- Phase 2: precision-weighted prediction error (`mean_error`/`variance` EMA, precision clamping)
+- Phase 3: sparse spread (sort by weight, truncate to 64)
+- Phase 4: event-driven STDP (incident-only via FiredNodesBuffer + processed_pairs HashSet)
+- `ConsolidationReport.categories_synthesized: usize` — category synthesis counter
+- `consolidation.rs: synthesize_categories()` — cluster detection, signature extraction, edge migration, parent node creation
 
 ### curiosity-core
 - `CuriosityBudget` — energy pool, `step_cost()`, `halt_threshold()`, `consume()`
@@ -404,6 +499,10 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - `VISUAL_SPATIAL_SCALE` (200), `VISUAL_ROTATION_X/Y/Z` (201-203), `VISUAL_COLOR_CHROMA` (204), `VISUAL_TOPOLOGY_WIREFRAME` (205) — fixed canonical indices
 - `GraphArena::insert_at()` — insert node at specific raw index, padding with empty slots
 - `GraphArena::get_active_visual_primitives(&self, activations) -> FixedVisualPayload` — extraction method
+- `GroundedNode.mean_error`, `GroundedNode.variance` — EMA prediction statistics for precision-weighted error
+- `CachedPath { source, destination, relation_mask, path_weight }` — path cache entry (16 slots)
+- `GraphArena::path_cache: parking_lot::Mutex<[Option<CachedPath>; 16]>` — interior mutability cache
+- `GraphArena::cache_hit()`, `cache_store()` — cache operations, invalidated on structural mutation
 
 ### asset-ingestor additions
 - `effector.rs` — `GravityVector`, `PaletteInterpolator`, `SkeletalTransformMatrix` (4×4 rotation, gravity decomposition, rest-pose adjustment)
@@ -423,6 +522,14 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - `SensorMapper::map_light_sensor(lux) -> [(NodeId; f64); 2]` — light→chroma + scale
 - `SensorMapper::variance_error(prev, curr) -> Option<f64>` — >30% delta → prediction error magnitude
 - `CognitiveDaemon::handle_event()` — SensorReading events call SensorMapper inject into visual primitives
+- `FiredNodesBuffer: [u32; 1024]` with `fired_nodes_count: usize` — tracks firing nodes for Phase 4
+- `SPARSE_SPREAD_MAX_EDGES = 64` — hub node spread truncation
+- `SPARSE_SPREAD_MIN_ENERGY = 0.005` — spread termination threshold
+- Phase 2: precision-weighted prediction error (mean_error/variance EMA updates)
+- Phase 3: sparse spread (sort-by-weight truncation for high-degree nodes)
+- Phase 4: event-driven STDP (incident-only via FiredNodesBuffer + processed_pairs)
+- `ConsolidationReport.categories_synthesized: usize` — tracks synthesized categories
+- `consolidation.rs: synthesize_categories()` — isomorphism scanner, cluster detection (3+ nodes ≥80% signature overlap), parent node creation with IsA anchoring
 
 ## Critical Rules for Agent
 
@@ -436,3 +543,9 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 8. Visual primitive nodes must always be inserted at their fixed canonical indices via `GraphArena::insert_at()` — never via `insert()` — so that `SensorMapper` injection targets and `get_active_visual_primitives()` extraction work correctly.
 9. The SPSC ring buffer (`VisualPrimitiveRingBuffer`) must never be read/written from multiple threads — single producer (cognitive daemon Phase 6) and single consumer (render bridge thread) only.
 10. `SensorMapper` is stateless — all sensor history for variance detection lives in `CognitiveDaemon::prev_sensor_values`, not in the mapper.
+11. Precision-weighted prediction error: always compute `precision = 1.0 / (variance + 0.001)`, clamp [0.1, 10.0], and compare `weighted_error = raw_error * precision` against `PREDICTION_ERROR_THRESHOLD`. Never compare raw error against threshold.
+12. `variance`/`mean_error` on `GroundedNode` must be updated every tick when a prediction exists: `mean_error += 0.05 * (raw_error - mean_error)`; `variance += 0.05 * ((actual - expected)^2 - variance)`.
+13. Category synthesis must only run during quiescence (novelty < 0.1, arousal < 0.1). Never during active sensor processing.
+14. Sparse spread: only sort edges when `edge_count > SPARSE_SPREAD_MAX_EDGES` (64). Normal-degree nodes iterate all edges without sorting.
+15. `FiredNodesBuffer` must be cleared at end of Phase 4 (`fired_nodes_count = 0`). The raw buffer array is not zeroed — stale indices are overwritten by next Phase 3 push.
+16. Path cache must be invalidated (`.fill(None)`) on every structural mutation: `insert`, `insert_at`, `link_to_self`, `garbage_collect_edges`. Never skip invalidation.

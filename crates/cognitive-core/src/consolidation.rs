@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use semantic_graph::prelude::*;
 
 // ────────────────────────────────────────────────────────────
@@ -11,7 +12,9 @@ use semantic_graph::prelude::*;
 //       and activation below threshold.
 //    2. Compress linear chains — A→B→C where B is a "pass-through"
 //       becomes macro-node AC with edge A→C (merging weights).
-//    3. Mark zombie edges for garbage collection.
+//    3. Autonomous category synthesis — detect structurally
+//       isomorphic node clusters and hoist abstract parents.
+//    4. Mark zombie edges for garbage collection.
 //
 //  This runs on a background thread with full graph write access.
 //  Not called during the hot tick loop.
@@ -22,6 +25,7 @@ pub struct ConsolidationReport {
     pub edges_pruned: usize,
     pub nodes_pruned: usize,
     pub chains_compressed: usize,
+    pub categories_synthesized: usize,
     pub nodes_before: usize,
     pub nodes_after: usize,
 }
@@ -32,17 +36,202 @@ pub fn consolidate(graph: &mut GraphArena) -> ConsolidationReport {
     let nodes_before = graph.len();
 
     let edges_pruned = garbage_collect_edges(graph);
-    let (chains_compressed, nodes_pruned) = compress_linear_chains(graph);
+    let (chains_compressed, chain_nodes_pruned) = compress_linear_chains(graph);
+    let categories_synthesized = synthesize_categories(graph);
 
     let nodes_after = graph.len();
 
     ConsolidationReport {
         edges_pruned,
-        nodes_pruned,
+        nodes_pruned: chain_nodes_pruned,
         chains_compressed,
+        categories_synthesized,
         nodes_before,
         nodes_after,
     }
+}
+
+/// Minimum number of nodes with 80%+ signature overlap to trigger hoisting.
+const ISOMORPHISM_CLUSTER_SIZE: usize = 3;
+
+/// Minimum overlap ratio for two nodes to be considered isomorphic.
+const ISOMORPHISM_OVERLAP_THRESHOLD: f64 = 0.80;
+
+/// Maximum edges considered for signature extraction.
+const SIGNATURE_MAX_EDGES: usize = 32;
+
+/// Extract a canonical relational signature from a node's outbound edges.
+/// The signature is a sorted list of (relation, target) tuples, limited
+/// to SIGNATURE_MAX_EDGES edges. A deterministic hash is derived for quick
+/// isomorphism comparison.
+fn extract_edge_signature(node: &GroundedNode) -> (Vec<(u8, u64)>, u64) {
+    let mut pairs: Vec<(u8, u64)> = node.edges.iter()
+        .take(SIGNATURE_MAX_EDGES)
+        .map(|e| (e.relation as u8, e.target.0))
+        .collect();
+    pairs.sort_unstable();
+    let hash: u64 = pairs.iter().fold(0u64, |h, &(r, t)| {
+        h.wrapping_mul(31).wrapping_add(r as u64).wrapping_mul(7).wrapping_add(t)
+    });
+    (pairs, hash)
+}
+
+/// Compute Jaccard-like overlap ratio between two edge signatures.
+fn signature_overlap(a: &[(u8, u64)], b: &[(u8, u64)]) -> f64 {
+    if a.is_empty() && b.is_empty() {
+        return 1.0;
+    }
+    let mut intersection = 0usize;
+    let mut union = 0usize;
+    let mut i = 0;
+    let mut j = 0;
+    while i < a.len() || j < b.len() {
+        if i < a.len() && j < b.len() && a[i] == b[j] {
+            intersection += 1;
+            union += 1;
+            i += 1;
+            j += 1;
+        } else if j >= b.len() || (i < a.len() && a[i] < b[j]) {
+            union += 1;
+            i += 1;
+        } else {
+            union += 1;
+            j += 1;
+        }
+    }
+    if union == 0 { 0.0 } else { intersection as f64 / union as f64 }
+}
+
+/// Scan the graph for isomorphic node clusters and hoist abstract categories.
+///
+/// For each pair of nodes with high signature overlap, group them.
+/// When a cluster of 3+ nodes with ≥80% overlap is found, create a
+/// new parent concept node, migrate shared edges, and anchor children.
+fn synthesize_categories(graph: &mut GraphArena) -> usize {
+    let node_count = graph.len();
+    if node_count < 4 {
+        return 0; // need at least 3 candidates + room for parent
+    }
+
+    // Collect signatures for all non-dead concept nodes
+    let mut signatures: Vec<(u64, u64, Vec<(u8, u64)>)> = Vec::new(); // (index, hash, pairs)
+    for i in 2..node_count {
+        let node = graph.get(NodeId::from_raw(i as u64));
+        if let Some(n) = node {
+            let guard = n.read();
+            if guard.node_type != NodeType::Concept || guard.edges.is_empty() {
+                continue;
+            }
+            if guard.threshold >= f64::MAX {
+                continue; // dead node
+            }
+            let (pairs, hash) = extract_edge_signature(&guard);
+            signatures.push((i as u64, hash, pairs));
+        }
+    }
+
+    if signatures.len() < ISOMORPHISM_CLUSTER_SIZE {
+        return 0;
+    }
+
+    // Cluster by pairwise signature overlap
+    let mut clustered: Vec<Vec<u64>> = Vec::new();
+    let mut assigned: HashSet<u64> = HashSet::new();
+
+    for i in 0..signatures.len() {
+        let (id_i, _, ref pairs_i) = signatures[i];
+        if assigned.contains(&id_i) {
+            continue;
+        }
+        let mut cluster = vec![id_i];
+        assigned.insert(id_i);
+
+        for j in (i + 1)..signatures.len() {
+            let (id_j, _, ref pairs_j) = signatures[j];
+            if assigned.contains(&id_j) {
+                continue;
+            }
+            let overlap = signature_overlap(pairs_i, pairs_j);
+            if overlap >= ISOMORPHISM_OVERLAP_THRESHOLD {
+                cluster.push(id_j);
+                assigned.insert(id_j);
+            }
+        }
+
+        if cluster.len() >= ISOMORPHISM_CLUSTER_SIZE {
+            clustered.push(cluster);
+        }
+    }
+
+    // Hoist each cluster → create parent node, migrate edges
+    let mut categories_synthesized = 0;
+
+    for cluster in &clustered {
+        // Gather the child node labels for naming
+        let labels: Vec<String> = cluster.iter()
+            .filter_map(|id| graph.label_of(NodeId::from_raw(*id)))
+            .collect();
+
+        // Find overlapping edges across all children
+        let mut edge_intersection: Vec<(Relation, NodeId, f64)> = {
+            let first = cluster[0];
+            let node = graph.get(NodeId::from_raw(first)).unwrap();
+            let guard = node.read();
+            guard.edges.iter().map(|e| (e.relation, e.target, e.effective_weight())).collect()
+        };
+
+        for &child_id in &cluster[1..] {
+            let node = graph.get(NodeId::from_raw(child_id)).unwrap();
+            let guard = node.read();
+            edge_intersection.retain(|(rel, tgt, _)| {
+                guard.edges.iter().any(|e| e.relation == *rel && e.target == *tgt)
+            });
+        }
+
+        if edge_intersection.is_empty() {
+            continue;
+        }
+
+        // Create parent node
+        let parent_label = format!("Concept_Cluster_{:X}", cluster[0]);
+        let avg_valence: f64 = cluster.iter()
+            .filter_map(|id| graph.get_valence(NodeId::from_raw(*id)))
+            .sum::<f64>() / cluster.len() as f64;
+
+        let parent_edges: Vec<Edge> = edge_intersection.iter()
+            .map(|(rel, tgt, _)| Edge::with_weight(*rel, *tgt, 0.8))
+            .collect();
+
+        let parent = GroundedNode {
+            id: NodeId::ZERO,
+            label: parent_label.clone(),
+            node_type: NodeType::Concept,
+            grounding: Grounding::Abstract,
+            decay: 0.92,
+            threshold: 1.2,
+            base_activation: 0.0,
+            edges: parent_edges,
+            valence: avg_valence,
+            mean_error: 0.0,
+            variance: 0.0,
+        };
+        let parent_id = graph.insert(parent);
+
+        // Anchor each child to parent with IsA edge; remove overlapping edges from children
+        for &child_id in cluster {
+            if let Some(n) = graph.get(NodeId::from_raw(child_id)) {
+                let mut guard = n.write();
+                guard.edges.push(Edge::with_weight(Relation::IsA, parent_id, 1.0));
+                guard.edges.retain(|e| {
+                    !edge_intersection.iter().any(|(r, t, _)| e.relation == *r && e.target == *t)
+                });
+            }
+        }
+
+        categories_synthesized += 1;
+    }
+
+    categories_synthesized
 }
 
 /// Remove edges that have been marked for pruning (|weight| < PRUNE_THRESHOLD).
@@ -187,6 +376,8 @@ mod tests {
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         graph.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -196,6 +387,8 @@ mod tests {
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(4))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
         graph.insert(GroundedNode {
             id: NodeId::ZERO,
@@ -205,6 +398,8 @@ mod tests {
             decay: 0.9, threshold: 5.0, base_activation: 0.0,
             edges: vec![],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         let report = consolidate(&mut graph);

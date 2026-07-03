@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::collections::HashSet;
 
 use semantic_graph::prelude::*;
 use crate::{VerificationLoop, VerificationEvent};
@@ -32,6 +33,18 @@ pub const SPREAD_RATE: f64 = 0.15;
 pub const DECAY_GLOBAL: f64 = 0.97;
 pub const BASE_INJECT: f64 = 0.4;
 pub const ACTIVATION_MIN: f64 = 0.001;
+
+/// Maximum edges to process for a single firing node during sparse spread.
+/// Beyond this threshold, only the top N strongest edges receive energy.
+pub const SPARSE_SPREAD_MAX_EDGES: usize = 64;
+
+/// Minimum remaining energy threshold for sparse spread termination.
+/// Propagation stops when remaining energy falls below this value.
+pub const SPARSE_SPREAD_MIN_ENERGY: f64 = 0.005;
+
+/// Capacity of the FiredNodesBuffer for event-driven STDP.
+/// Must be ≥ max expected firing nodes per tick.
+pub const FIRED_BUFFER_CAPACITY: usize = 1024;
 
 /// Result when a node crosses its threshold.
 #[derive(Debug, Clone)]
@@ -102,6 +115,15 @@ pub struct ActivationEngine {
     // ── Staging arrays (pre-allocated, zero alloc in hot path) ──
     /// Which nodes fired this tick (bitset, parallel to firing_history words)
     fired_this_tick: Vec<u64>,
+
+    // ── Event-driven STDP: FiredNodesBuffer ──
+    /// Fixed-capacity buffer of fired node indices for Phase 4.
+    /// During Phase 3, when a node fires, its index is pushed here.
+    /// Phase 4 uses this to iterate only incident edges instead of
+    /// the full graph O(N+E) — critical for high-degree hub nodes.
+    fired_nodes_buffer: [u32; FIRED_BUFFER_CAPACITY],
+    /// Number of valid entries in fired_nodes_buffer.
+    fired_nodes_count: usize,
 }
 
 impl ActivationEngine {
@@ -125,6 +147,8 @@ impl ActivationEngine {
             effector_buffer,
             visual_ring,
             fired_this_tick: vec![0; words.max(1)],
+            fired_nodes_buffer: [0u32; FIRED_BUFFER_CAPACITY],
+            fired_nodes_count: 0,
             ctx,
         }
     }
@@ -215,20 +239,40 @@ impl ActivationEngine {
                 a = 0.0;
             }
 
-            // ── Prediction error check ──
+            // ── Prediction error check (precision-weighted) ──
             let predicted = self.predictions[i];
             if predicted > ACTIVATION_MIN {
-                let error = (a - predicted).abs() / predicted.max(ACTIVATION_MIN);
-                if error > PREDICTION_ERROR_THRESHOLD {
+                let raw_error = (a - predicted).abs() / predicted.max(ACTIVATION_MIN);
+
+                // Drop read lock before acquiring write lock for variance update
+                drop(node);
+                let (new_var, weighted_error) = if let Some(n) = graph.get(NodeId::from_raw(i as u64)) {
+                    let mut w = n.write();
+                    let old_var = w.variance;
+                    let old_mean = w.mean_error;
+                    let new_mean = old_mean + 0.05 * (raw_error - old_mean);
+                    let sq_err = (a - predicted).powi(2);
+                    let new_var = old_var + 0.05 * (sq_err - old_var);
+                    w.mean_error = new_mean;
+                    w.variance = new_var;
+                    let precision = (1.0 / (new_var + 0.001)).clamp(0.1, 10.0);
+                    (new_var, raw_error * precision)
+                } else {
+                    (0.0, raw_error)
+                };
+                let _ = new_var;
+
+                if weighted_error > PREDICTION_ERROR_THRESHOLD {
                     self.prediction_errors.push(PredictionError {
                         node_id: NodeId::from_raw(i as u64),
                         expected: predicted,
                         actual: a,
-                        error_magnitude: error,
+                        error_magnitude: weighted_error,
                     });
-                    // Spike novelty proportional to prediction error
-                    self.modulators.spike_novelty(error * 0.15);
+                    self.modulators.spike_novelty(weighted_error * 0.15);
                 }
+            } else {
+                drop(node);
             }
 
             activations[i] = a;
@@ -270,6 +314,12 @@ impl ActivationEngine {
                     grounding: grounding.clone(),
                 });
 
+                // ── Push to FiredNodesBuffer for event-driven Phase 4 ──
+                if self.fired_nodes_count < FIRED_BUFFER_CAPACITY {
+                    self.fired_nodes_buffer[self.fired_nodes_count] = i as u32;
+                    self.fired_nodes_count += 1;
+                }
+
                 // ── Render feedback loop: if MotorCommand, record render command ──
                 if let Grounding::MotorCommand { command_type, ref target, ref parameters } = grounding {
                     let predicted_hash = (command_type.label().len() as u64)
@@ -300,15 +350,41 @@ impl ActivationEngine {
                 continue;
             }
 
-            // ── Spread to neighbors ──
-            for edge in &node.edges {
-                let target_idx = edge.target.0 as usize;
-                if target_idx >= node_count {
-                    continue;
+            // ── Sparse spread to neighbors ──
+            let edge_count = node.edges.len();
+            if edge_count > SPARSE_SPREAD_MAX_EDGES {
+                // High-degree node: sort edges by weight and only spread to top N
+                let mut sorted: Vec<(usize, f64)> = node.edges.iter().enumerate()
+                    .map(|(idx, e)| (idx, e.effective_weight()))
+                    .collect();
+                sorted.sort_unstable_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+                let mut remaining = a_i;
+                for (idx, _w) in sorted.iter().take(SPARSE_SPREAD_MAX_EDGES) {
+                    if remaining.abs() < SPARSE_SPREAD_MIN_ENERGY {
+                        break;
+                    }
+                    let edge = &node.edges[*idx];
+                    let target_idx = edge.target.0 as usize;
+                    if target_idx >= node_count {
+                        continue;
+                    }
+                    let spread_energy = remaining * edge.effective_weight() * SPREAD_RATE;
+                    activations[target_idx] += spread_energy;
+                    remaining -= spread_energy;
                 }
-                let spread_energy = a_i * edge.effective_weight() * SPREAD_RATE;
-                activations[target_idx] += spread_energy;
-                activations[i] -= spread_energy; // conservation
+                activations[i] = remaining;
+            } else {
+                // Normal-degree node: iterate all edges
+                for edge in &node.edges {
+                    let target_idx = edge.target.0 as usize;
+                    if target_idx >= node_count {
+                        continue;
+                    }
+                    let spread_energy = a_i * edge.effective_weight() * SPREAD_RATE;
+                    activations[target_idx] += spread_energy;
+                    activations[i] -= spread_energy;
+                }
             }
         }
 
@@ -325,19 +401,30 @@ impl ActivationEngine {
         }
 
         // ──────────────────────────────────────────────────
-        //  Phase 4 — STDP + pruning
+        //  Phase 4 — Event-driven STDP + pruning
         // ──────────────────────────────────────────────────
         //
-        //  Iterate all edges (O(E)). For each:
-        //    1. Eligibility decay
-        //    2. Eligibility boost if source fired this tick
-        //    3. LTP if target fired this tick → consume eligibility
-        //    4. LTD drift toward default weight
-        //    5. Mark for pruning if |dynamic_weight| < PRUNE_THRESHOLD
+        //  Instead of iterating all edges (O(N+E) global), we use
+        //  the FiredNodesBuffer to process only edges incident to
+        //  nodes that fired this tick. For each fired node:
+        //    1. Process outbound edges (eligibility decay, LTP)
+        //    2. Scan inbound edges from other fired nodes (LTP)
+        //    3. LTD drift + mark for pruning
+        //
+        //  This is O(F * avg_degree) instead of O(N + E), critical
+        //  when a high-degree hub like SELF has thousands of edges.
 
         let mut prune_targets: Vec<(usize, usize)> = Vec::with_capacity(16);
+        let mut processed_pairs: HashSet<(usize, usize)> = HashSet::new();
+        let fired_count = self.fired_nodes_count;
 
-        for i in 1..node_count {
+        for fn_idx in 0..fired_count {
+            let i = self.fired_nodes_buffer[fn_idx] as usize;
+            if i >= node_count || i == 0 {
+                continue;
+            }
+
+            // ── Outbound edges from fired node i ──
             let node = match graph.get(NodeId::from_raw(i as u64)) {
                 Some(n) => n.write(),
                 None => continue,
@@ -347,17 +434,24 @@ impl ActivationEngine {
                 // Eligibility decay
                 edge.eligibility *= ELIGIBILITY_DECAY;
 
-                // Boost if source (i) fired this tick
-                if self.is_fired_this_tick(i) {
-                    edge.eligibility += 1.0;
-                }
+                // Boost when source (i) fired this tick
+                edge.eligibility += 1.0;
 
                 // LTP: if target fired this tick, consume eligibility
                 let target_idx = edge.target.0 as usize;
-                if target_idx < node_count && self.is_fired_this_tick(target_idx) {
+
+                // Check if target was in this tick's fired set
+                let target_fired = if target_idx < node_count {
+                    self.is_fired_this_tick(target_idx)
+                } else {
+                    false
+                };
+
+                if target_fired {
                     let delta = edge.eligibility * LTP_RATE * plasticity_mod;
                     edge.dynamic_weight = (edge.dynamic_weight + delta).clamp(-1.0, 1.0);
-                    edge.eligibility *= 0.5; // consumed
+                    edge.eligibility *= 0.5;
+                    processed_pairs.insert((i, target_idx));
                 }
 
                 // LTD drift toward default weight
@@ -371,10 +465,37 @@ impl ActivationEngine {
                     edge.dynamic_weight = 0.0;
                 }
             }
+
+            // ── Inbound edges from other fired nodes → LTP ──
+            // Scan backward through the buffer to find pairs (j→i) where
+            // j also fired this tick and we haven't processed (j,i) yet.
+            for fn_j in 0..fn_idx {
+                let j = self.fired_nodes_buffer[fn_j] as usize;
+                if j == i || j >= node_count {
+                    continue;
+                }
+                if processed_pairs.contains(&(j, i)) {
+                    continue; // already handled by outbound processing
+                }
+
+                // Check if j has an edge to i
+                let got = graph.get(NodeId::from_raw(j as u64));
+                if let Some(guard) = got {
+                    let mut n = guard.write();
+                    for edge in &mut n.edges {
+                        if edge.target.0 as usize == i {
+                            let delta = edge.eligibility * LTP_RATE * plasticity_mod;
+                            edge.dynamic_weight = (edge.dynamic_weight + delta).clamp(-1.0, 1.0);
+                            edge.eligibility *= 0.5;
+                            processed_pairs.insert((j, i));
+                        }
+                    }
+                }
+            }
         }
 
-        // Prune edges with |weight| < threshold (set weight to 0, will be GC'd later)
-        // We mark them by zeroing dynamic_weight so they become effectively disconnected
+        // ⎯⎯  LTD drift for all nodes (lightweight, just weight drift) ──
+        // Scan any nodes that had edges updated during pruning
         for (node_idx, edge_idx) in &prune_targets {
             if let Some(node_lock) = graph.get(NodeId::from_raw(*node_idx as u64)) {
                 let mut node = node_lock.write();
@@ -383,6 +504,9 @@ impl ActivationEngine {
                 }
             }
         }
+
+        // Reset FiredNodesBuffer for next tick
+        self.fired_nodes_count = 0;
 
         // ──────────────────────────────────────────────────
         //  Phase 5 — Valence update (preference formation)
@@ -687,6 +811,8 @@ mod tests {
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(2))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         g.insert(GroundedNode {
@@ -699,6 +825,8 @@ mod tests {
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Implies, NodeId::from_raw(3))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         g.insert(GroundedNode {
@@ -713,6 +841,8 @@ mod tests {
             base_activation: 0.0,
             edges: Vec::new(),
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         g
@@ -783,6 +913,8 @@ mod tests {
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::Activates, NodeId::from_raw(3))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         };
         let n3 = GroundedNode {
             id: NodeId::ZERO,
@@ -794,6 +926,8 @@ mod tests {
             base_activation: 0.0,
             edges: Vec::new(),
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         };
         graph.insert(n3);
 
@@ -855,6 +989,8 @@ mod tests {
             base_activation: 0.0,
             edges: Vec::new(),
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         };
         graph.insert(node);
         let ctx = SemanticContext::new(graph);

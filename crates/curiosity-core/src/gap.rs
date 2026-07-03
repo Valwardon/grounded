@@ -271,6 +271,8 @@ mod tests {
                 Edge::new(Relation::HasProperty, NodeId::from_raw(3)), // "quadruped"
             ],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         // Grounded: animal
@@ -284,6 +286,8 @@ mod tests {
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::HasProperty, NodeId::from_raw(3))],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         // Grounded: quadruped (primitive — has edges)
@@ -297,6 +301,8 @@ mod tests {
             base_activation: 0.0,
             edges: vec![Edge::new(Relation::HasProperty, cat_id)],
             valence: 0.0,
+            mean_error: 0.0,
+            variance: 0.0,
         });
 
         SemanticContext::new(g)

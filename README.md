@@ -102,20 +102,33 @@ For each node, every 16ms tick (6-phase):
     novelty/arousal/reward leak toward baseline.
     Compute global threshold_mod, plasticity_mod.
 
-  Phase 2 — Decay + Injection + Prediction Error:
+  Phase 2 — Decay + Injection + Precision-Weighted Prediction Error:
     activation *= node.decay * 0.97
     activation += sensor/intent energy
-    |activation - prediction| > 30% → PredictionError → novelty spike
+    if prediction exists:
+      raw_error = |actual - expected| / max(expected, 0.001)
+      precision = clamp(1.0 / (node.variance + 0.001), 0.1, 10.0)
+      weighted_error = raw_error * precision
+      update node.mean_error += 0.05 * (raw_error - mean_error)
+      update node.variance += 0.05 * ((actual-expected)² - variance)
+      if weighted_error > 30% → PredictionError → novelty spike
 
-  Phase 3 — Spread + Eligibility:
+  Phase 3 — Sparse Spread + Firing:
     if activation > threshold * threshold_mod → fire, reset to 0
-    else: for each edge, spread energy to neighbor (conservation)
-          if MotorCommand → push RenderCommand + RenderPrediction
+      push node index to FiredNodesBuffer
+      if MotorCommand → push RenderCommand + RenderPrediction
+    else:
+      if edge_count > 64: sort by weight, truncate to top 64
+      spread energy to neighbors (conservation)
+      stop when energy < 0.005
 
-  Phase 4 — STDP + pruning:
-    for each edge: decay eligibility, boost if source fired,
-    if target fired: LTP = eligibility * rate * plasticity_mod,
+  Phase 4 — Event-Driven STDP + pruning:
+    for each node in FiredNodesBuffer:
+      decay eligibility on its edges, LTP if co-fire
+    for each pair in FiredNodesBuffer:
+      check bidirectional edges, apply LTP/LTD
     drift toward default weight, prune if |weight| < 0.005
+    clear FiredNodesBuffer
 
   Phase 5 — Valence update (preference formation):
     fire + prediction error → negative drift
@@ -124,7 +137,8 @@ For each node, every 16ms tick (6-phase):
 
   Phase 6 — Structural verification:
     energy conservation check (pre-spread vs post-spread)
-    fired-chain path integrity (verify_path on edge contracts)
+    fired-chain path integrity (cached verify_path — skips
+      per-edge contract checks for previously verified pairs)
     penalties: novelty spike, valence drop, edge prune marking
 ```
 
@@ -149,9 +163,15 @@ Every activation tick computes a forward prediction: "what activation level do I
 ```
 tick N: spread activation → compute prediction[node] = activation[node]
 tick N+1: compare actual vs prediction
-           error = |actual - expected| / expected
-           if error > 0.3 → spike novelty, inject into curiosity gap node
+           raw_error = |actual - expected| / max(expected, 0.001)
+           precision = clamp(1.0 / (node.variance + 0.001), 0.1, 10.0)
+           weighted_error = raw_error * precision
+           node.mean_error += 0.05 * (raw_error - mean_error)
+           node.variance += 0.05 * ((actual-expected)² - variance)
+           if weighted_error > 0.3 → spike novelty, inject into curiosity gap node
 ```
+
+Each node tracks its own prediction reliability (`mean_error`, `variance` EMAs). High-variance nodes (noisy sensors) naturally self-attenuate — their precision approaches 0.1, reducing effective error up to 10×. This prevents runaway curiosity loops from sensor jitter.
 
 Render feedback follows the same pattern: expected render hash vs actual render hash.
 
@@ -168,6 +188,7 @@ Between LTP events, `dynamic_weight` slowly drifts toward the architecturally-in
 When neuromodulator levels are low (novelty < 0.1, arousal < 0.1) and 1000 ticks have elapsed (~16s), the engine runs an offline consolidation pass:
 - **Edge GC** — removes pruned edges
 - **Linear chain compression** — A→B→C where B is a pass-through node (indegree=1, outdegree=1) becomes direct edge A→C with combined weight
+- **Autonomous category synthesis** — clusters nodes sharing ≥80% edge signature overlap into a parent `Concept_Cluster` node with `IsA` edges. Creates abstract categories without external supervision.
 
 ### The Self Node
 
@@ -287,7 +308,7 @@ Polls both the lock-free `VisualEffectorBuffer` and `VisualPrimitiveRingBuffer` 
 
 Every `Edge` carries an optional `InvariantContract`. If not explicitly set, `effective_contract()` falls back to the `Relation::canonical_contract()`.
 
-**`GraphArena::verify_path(path)`** validates a sequence of node IDs against their contracts.
+**`GraphArena::verify_path(path)`** validates a sequence of node IDs against their contracts. Uses a 16-slot incremental path cache (`parking_lot::Mutex<[Option<CachedPath>; 16]>`) — if `(source, dest)` was previously verified, per-edge contract checks are skipped. Cache is invalidated on any structural mutation.
 **`GraphArena::find_path(start, end)`** uses BFS to find the shortest valid traversal.
 
 ### 2. AST-Driven Integrity (asset pipeline)
@@ -381,9 +402,9 @@ After every tick's valence update:
 
 | Crate | Purpose |
 |-------|---------|
-| `semantic-graph` | GroundedNode (valence), GraphArena, ActivationBuffer, Edge (STDP, contract), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 10 Relation types, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives, **VisualPrimitiveType** (6 visual primitive variants), **Grounding::VisualPrimitive**, **FixedVisualPayload** (6 f64 fields), **VisualPrimitiveRingBuffer** (lock-free SPSC, 64 slots) |
+| `semantic-graph` | GroundedNode (valence, **mean_error**, **variance**), GraphArena (**path_cache**: 16-slot `CachedPath` with interior mutability), ActivationBuffer, Edge (STDP, contract), FiringHistory, Neuromodulator, PrimitiveVector (5-d algebra), FrameSchema/FrameInstance (slot-based meaning), 10 Relation types, MotorCommandType (effector commands), **VisualEffectorBuffer** (lock-free atomic double buffer), effector_state module (22-element pack/unpack), 31 base+derived primitives, **VisualPrimitiveType** (6 visual primitive variants), **Grounding::VisualPrimitive**, **FixedVisualPayload** (6 f64 fields), **VisualPrimitiveRingBuffer** (lock-free SPSC, 64 slots) |
 | `semantic-parser` | Verb→CDAction table (30+), sensor parsing, Realizer, **CCG RelationalParser** (shift-reduce, semantic categories, 7 reduction rules, proximity fallback) |
-| `cognitive-core` | ActivationEngine (6-phase tick), VerificationLoop, CognitiveDaemon, **RenderCommand/RenderPrediction feedback loop**, Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), EventChannel, Consolidation |
+| `cognitive-core` | ActivationEngine (6-phase tick: **precision-weighted prediction error**, **sparse spread** with TRIM=64, **event-driven STDP** via `FiredNodesBuffer [u32; 1024]`), VerificationLoop, CognitiveDaemon, **RenderCommand/RenderPrediction feedback loop**, Phase 6 VisualEffectorBuffer + **VisualPrimitiveRingBuffer push**, **SensorMapper** (stateless fixed-point accelerometer/light→visual primitive injection), EventChannel, Consolidation (**synthesize_categories()**) |
 | `hw-daemon` | Android lifecycle bridge, graph persistence, keepalive, modulate/consolidate bridge, **RenderBridge** (OS thread, dual buffer + ring polling, RenderBackend trait, Null/Wgpu backends), **PenalizeFn** (–0.05 valence on validate_ast() error) |
 | `curiosity-core` | Gap detection, **CCG-based DefinitionResolver**, async harvester, **CuriosityBudget** (energy-aware, replaces depth 10) |
 | `asset-ingestor` | Prompt decomposition, quadruped→biped transform, RenderAst (incl. **Effector** variant), compile_to_ast/validate_ast/render_ast_to_json, **effector math** (GravityVector, PaletteInterpolator, SkeletalTransformMatrix), **TransformEngine** (sensor→effector) |
@@ -420,6 +441,11 @@ After every tick's valence update:
 - [x] **Phase 6 ring buffer push**: cluster activation > threshold → push to SPSC ring buffer alongside existing VisualEffectorBuffer push
 - [x] **Render bridge ring polling**: reads FixedVisualPayload from ring buffer alongside existing effector buffer reads
 - [x] **validate_ast() → –0.05 valence**: PenalizeFn deducts valence on structural errors detected during render
+- [x] **Precision-weighted prediction error**: per-node `mean_error`/`variance` EMA, precision = 1/(variance+0.001) clamped [0.1, 10.0], weighted_error vs threshold
+- [x] **Sparse spread**: sort+truncate to 64 edges for high-degree nodes, early termination at 0.005 remaining energy
+- [x] **Event-driven STDP**: FiredNodesBuffer [u32; 1024], incident-only edge processing in Phase 4 (O(F·avg_degree) instead of O(N+E))
+- [x] **Incremental path cache**: 16-slot `CachedPath` cache in GraphArena with interior mutability, invalidated on structural mutation
+- [x] **Autonomous category synthesis**: isomorphism scanner during consolidation, ≥80% edge signature overlap → Concept_Cluster parent with IsA edges
 - [ ] `cargo test` pass (needs actual test environment)
 - [ ] Integration: persist graph → survive restart → resume curiosity
 
