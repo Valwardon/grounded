@@ -94,13 +94,22 @@ pub struct ActivationEngine {
     /// Optional lock-free buffer for pushing effector commands to the render bridge.
     pub effector_buffer: Option<Arc<VisualEffectorBuffer>>,
 
+    // ── Visual primitive ring buffer (lock-free SPSC, shared with render bridge) ──
+    /// Optional lock-free ring buffer for streaming FixedVisualPayload
+    /// to the render bridge when visual primitive cluster activation exceeds threshold.
+    pub visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>,
+
     // ── Staging arrays (pre-allocated, zero alloc in hot path) ──
     /// Which nodes fired this tick (bitset, parallel to firing_history words)
     fired_this_tick: Vec<u64>,
 }
 
 impl ActivationEngine {
-    pub fn new(ctx: Arc<SemanticContext>, effector_buffer: Option<Arc<VisualEffectorBuffer>>) -> Self {
+    pub fn new(
+        ctx: Arc<SemanticContext>,
+        effector_buffer: Option<Arc<VisualEffectorBuffer>>,
+        visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>,
+    ) -> Self {
         let len = ctx.graph.read().len().max(64);
         let words = (len + 63) / 64;
         ActivationEngine {
@@ -114,6 +123,7 @@ impl ActivationEngine {
             pending_render_commands: Vec::with_capacity(8),
             render_predictions: Vec::with_capacity(8),
             effector_buffer,
+            visual_ring,
             fired_this_tick: vec![0; words.max(1)],
             ctx,
         }
@@ -459,6 +469,15 @@ impl ActivationEngine {
             buffer.write(&state);
         }
 
+        // ── Phase 6: Extract visual primitives → push to SPSC ring buffer ──
+        if let Some(ref ring) = self.visual_ring {
+            let payload = self.ctx.graph.read()
+                .get_active_visual_primitives(activations);
+            if payload.cluster_activation() > VISUAL_CLUSTER_THRESHOLD {
+                ring.push(&payload);
+            }
+        }
+
         // ── Advance firing history ring buffer ──
         self.firing_history.advance_tick();
 
@@ -703,7 +722,7 @@ mod tests {
     fn activation_propagates_and_fires() {
         let graph = test_graph();
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
 
         engine.inject(NodeId::from_raw(1), 2.5);
 
@@ -721,7 +740,7 @@ mod tests {
     fn energy_decays_to_zero() {
         let graph = test_graph();
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
 
         engine.inject(NodeId::from_raw(1), 0.3);
 
@@ -742,7 +761,7 @@ mod tests {
     fn activation_reads_after_tick() {
         let graph = test_graph();
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
         engine.inject(NodeId::from_raw(1), 0.5);
         let _fired = engine.tick();
         let activations = engine.read_activations();
@@ -779,7 +798,7 @@ mod tests {
         graph.insert(n3);
 
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
 
         let initial_weight = engine.ctx.graph.read()
             .get(NodeId::from_raw(2)).unwrap().read()
@@ -806,7 +825,7 @@ mod tests {
     fn prediction_error_spikes_novelty() {
         let graph = test_graph();
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
 
         // First tick establishes a prediction baseline
         engine.inject(NodeId::from_raw(1), 2.5);
@@ -839,7 +858,7 @@ mod tests {
         };
         graph.insert(node);
         let ctx = SemanticContext::new(graph);
-        let mut engine = ActivationEngine::new(ctx.clone());
+        let mut engine = ActivationEngine::new(ctx.clone(), None, None);
 
         // Inject below threshold (4.0 < 5.0), should not fire without neuromodulation
         engine.inject(NodeId::from_raw(2), 4.0);

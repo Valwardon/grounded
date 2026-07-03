@@ -251,6 +251,11 @@ pub enum Grounding {
         target: String,
         parameters: Vec<f64>,
     },
+    /// Visual primitive node — activation level maps directly to
+    /// a rendering parameter (scale, rotation, color, wireframe).
+    VisualPrimitive {
+        primitive_type: VisualPrimitiveType,
+    },
     Abstract,
 }
 
@@ -283,6 +288,32 @@ impl MotorCommandType {
     }
 }
 
+/// Visual primitive types — each maps to a dedicated node in the graph.
+/// Activation level of these nodes directly drives rendering parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VisualPrimitiveType {
+    SpatialScale,
+    RotationX,
+    RotationY,
+    RotationZ,
+    ColorChroma,
+    TopologyWireframe,
+}
+
+/// Fixed indices for visual primitive nodes in the GraphArena.
+/// Pre-inserted during graph initialization at these canonical positions.
+pub const VISUAL_SPATIAL_SCALE: u64 = 200;
+pub const VISUAL_ROTATION_X: u64 = 201;
+pub const VISUAL_ROTATION_Y: u64 = 202;
+pub const VISUAL_ROTATION_Z: u64 = 203;
+pub const VISUAL_COLOR_CHROMA: u64 = 204;
+pub const VISUAL_TOPOLOGY_WIREFRAME: u64 = 205;
+
+/// Threshold for activating the visual effector stream in Phase 6.
+/// When average activation across all visual primitive nodes exceeds
+/// this value, a FixedVisualPayload is pushed to the SPSC ring buffer.
+pub const VISUAL_CLUSTER_THRESHOLD: f64 = 0.15;
+
 // ────────────────────────────────────────────────────────────
 //  The GroundedNode
 // ────────────────────────────────────────────────────────────
@@ -308,7 +339,7 @@ pub struct GroundedNode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum NodeType {
-    Entity, Concept, Action, Sensor, State, Frame,
+    Entity, Concept, Action, Sensor, State, Frame, VisualPrimitive,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -431,6 +462,30 @@ impl GraphArena {
         let id = NodeId::from_raw(self.nodes.len() as u64);
         self.label_index.push((node.label.clone(), id));
         self.nodes.push(parking_lot::RwLock::new(node));
+        id
+    }
+
+    /// Insert a node at a specific index, padding with empty nodes if needed.
+    /// This is used by the default graph builder to place visual primitive
+    /// nodes at their canonical fixed indices.
+    pub fn insert_at(&mut self, raw_id: u64, mut node: GroundedNode) -> NodeId {
+        let id = NodeId::from_raw(raw_id);
+        node.id = id;
+        let idx = raw_id as usize;
+        while self.nodes.len() <= idx {
+            self.nodes.push(parking_lot::RwLock::new(GroundedNode {
+                id: NodeId::ZERO,
+                label: String::new(),
+                node_type: NodeType::State,
+                grounding: Grounding::Abstract,
+                decay: 0.0,
+                threshold: f64::MAX,
+                base_activation: 0.0,
+                edges: Vec::new(),
+                valence: 0.0,
+            }));
+        }
+        self.nodes[idx] = parking_lot::RwLock::new(node);
         id
     }
 
@@ -1300,6 +1355,231 @@ pub mod effector_state {
 }
 
 // ────────────────────────────────────────────────────────────
+//  FixedVisualPayload — zero-alloc intermediate render state
+//
+//  Extracted from GraphArena during Phase 6 by reading activation
+//  levels of visual primitive nodes. Streamed lock-free to the
+//  render bridge via VisualPrimitiveRingBuffer.
+// ────────────────────────────────────────────────────────────
+
+/// Fixed-size visual state extracted from active primitive nodes.
+/// All fields are f64 for direct atomic packing; wireframe is
+/// 0.0 (normal) or 1.0 (wireframe).
+#[derive(Debug, Clone, Copy)]
+pub struct FixedVisualPayload {
+    pub spatial_scale: f64,
+    pub rotation_x: f64,
+    pub rotation_y: f64,
+    pub rotation_z: f64,
+    pub chroma_saturation: f64,
+    pub wireframe: f64,
+}
+
+impl FixedVisualPayload {
+    pub const fn new() -> Self {
+        FixedVisualPayload {
+            spatial_scale: 0.0,
+            rotation_x: 0.0,
+            rotation_y: 0.0,
+            rotation_z: 0.0,
+            chroma_saturation: 0.0,
+            wireframe: 0.0,
+        }
+    }
+
+    /// Number of f64 fields in the payload.
+    pub const fn field_count() -> usize { 6 }
+
+    /// Convert to [f64; 6] for serialization.
+    pub fn as_array(&self) -> [f64; 6] {
+        [
+            self.spatial_scale,
+            self.rotation_x,
+            self.rotation_y,
+            self.rotation_z,
+            self.chroma_saturation,
+            self.wireframe,
+        ]
+    }
+
+    /// Reconstruct from [f64; 6].
+    pub fn from_array(arr: &[f64; 6]) -> Self {
+        FixedVisualPayload {
+            spatial_scale: arr[0],
+            rotation_x: arr[1],
+            rotation_y: arr[2],
+            rotation_z: arr[3],
+            chroma_saturation: arr[4],
+            wireframe: arr[5],
+        }
+    }
+
+    /// Compute total cluster activation (sum of all visual primitive activations).
+    pub fn cluster_activation(&self) -> f64 {
+        self.spatial_scale
+            + self.rotation_x.abs() + self.rotation_y.abs() + self.rotation_z.abs()
+            + self.chroma_saturation
+            + self.wireframe
+    }
+}
+
+// ────────────────────────────────────────────────────────────
+//  VisualPrimitiveRingBuffer — lock-free SPSC channel
+//
+//  Fixed-size ring buffer with atomic head/tail pointers.
+//  Single Producer (cognitive daemon Phase 6) writes 6 f64
+//  values per slot. Single Consumer (render bridge) reads them.
+//  No allocations, no locks, no spinning.
+// ────────────────────────────────────────────────────────────
+
+/// Number of slots in the ring buffer (must be power of two).
+pub const VISUAL_RING_SIZE: usize = 64;
+
+/// Mask for wrapping index arithmetic (assuming power of two).
+pub const VISUAL_RING_MASK: usize = VISUAL_RING_SIZE - 1;
+
+/// Words per slot: 6 f64 values packed as AtomicU64.
+const WORDS_PER_SLOT: usize = 6;
+
+/// Lock-free SPSC ring buffer for streaming FixedVisualPayload
+/// from the cognitive daemon thread to the render bridge thread.
+pub struct VisualPrimitiveRingBuffer {
+    /// Flat array of AtomicU64 words.
+    /// Slot i occupies indices [i * WORDS_PER_SLOT .. (i+1) * WORDS_PER_SLOT).
+    data: [AtomicU64; VISUAL_RING_SIZE * WORDS_PER_SLOT],
+    /// Write cursor — producer increments after filling a slot.
+    write_seq: AtomicU64,
+    /// Read cursor — consumer increments after consuming a slot.
+    read_seq: AtomicU64,
+}
+
+impl VisualPrimitiveRingBuffer {
+    /// Create a new, empty ring buffer.
+    pub fn new() -> Self {
+        VisualPrimitiveRingBuffer {
+            data: Default::default(),
+            write_seq: AtomicU64::new(0),
+            read_seq: AtomicU64::new(0),
+        }
+    }
+
+    /// Push a payload into the ring buffer.
+    /// Returns `false` if the buffer is full (caller should retry next tick).
+    pub fn push(&self, payload: &FixedVisualPayload) -> bool {
+        let seq = self.write_seq.load(Ordering::Relaxed);
+        let idx = (seq as usize) & VISUAL_RING_MASK;
+        let base = idx * WORDS_PER_SLOT;
+
+        // Check for buffer full: write_seq - read_seq >= RING_SIZE
+        let read = self.read_seq.load(Ordering::Acquire);
+        if seq.wrapping_sub(read) >= VISUAL_RING_SIZE as u64 {
+            return false;
+        }
+
+        // Write all 6 f64 values with Relaxed ordering
+        let arr = payload.as_array();
+        for i in 0..WORDS_PER_SLOT {
+            self.data[base + i].store(arr[i].to_bits(), Ordering::Relaxed);
+        }
+
+        // Ensure all payload stores are visible before write_seq increment
+        std::sync::atomic::fence(Ordering::Release);
+        self.write_seq.store(seq.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Pop the next payload from the ring buffer.
+    /// Returns `false` if the buffer is empty.
+    pub fn pop(&self, out: &mut FixedVisualPayload) -> bool {
+        let seq = self.read_seq.load(Ordering::Relaxed);
+        let write = self.write_seq.load(Ordering::Acquire);
+        if seq == write {
+            return false;
+        }
+
+        let idx = (seq as usize) & VISUAL_RING_MASK;
+        let base = idx * WORDS_PER_SLOT;
+
+        // Ensure we see the payload stores from the producer
+        std::sync::atomic::fence(Ordering::Acquire);
+
+        let mut arr = [0.0f64; 6];
+        for i in 0..WORDS_PER_SLOT {
+            arr[i] = f64::from_bits(self.data[base + i].load(Ordering::Relaxed));
+        }
+        *out = FixedVisualPayload::from_array(&arr);
+
+        self.read_seq.store(seq.wrapping_add(1), Ordering::Release);
+        true
+    }
+
+    /// Check if the buffer has any items.
+    pub fn is_empty(&self) -> bool {
+        self.read_seq.load(Ordering::Relaxed) == self.write_seq.load(Ordering::Acquire)
+    }
+
+    /// Number of items available to read.
+    pub fn len(&self) -> u64 {
+        let write = self.write_seq.load(Ordering::Acquire);
+        let read = self.read_seq.load(Ordering::Relaxed);
+        write.wrapping_sub(read)
+    }
+}
+
+impl Default for VisualPrimitiveRingBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl GraphArena {
+    /// Extract active visual primitives from the current activation buffer.
+    ///
+    /// Iterates all nodes in the arena, finds those with
+    /// `Grounding::VisualPrimitive`, and maps their activation levels
+    /// to the corresponding fields in `FixedVisualPayload`.
+    ///
+    /// Zero-allocation: reads directly from the node list and activation
+    /// slice, writes into a stack-allocated FixedVisualPayload.
+    pub fn get_active_visual_primitives(&self, activations: &[f64]) -> FixedVisualPayload {
+        let mut payload = FixedVisualPayload::new();
+
+        for (i, node_lock) in self.nodes.iter().enumerate() {
+            let activation = activations.get(i).copied().unwrap_or(0.0);
+            // Quick filter: skip nodes with near-zero activation
+            if activation.abs() < 0.001 {
+                continue;
+            }
+            let node = node_lock.read();
+            if let Grounding::VisualPrimitive { primitive_type } = &node.grounding {
+                match primitive_type {
+                    VisualPrimitiveType::SpatialScale => {
+                        payload.spatial_scale = activation.clamp(0.0, 1.0);
+                    }
+                    VisualPrimitiveType::RotationX => {
+                        payload.rotation_x = activation.clamp(-1.0, 1.0);
+                    }
+                    VisualPrimitiveType::RotationY => {
+                        payload.rotation_y = activation.clamp(-1.0, 1.0);
+                    }
+                    VisualPrimitiveType::RotationZ => {
+                        payload.rotation_z = activation.clamp(-1.0, 1.0);
+                    }
+                    VisualPrimitiveType::ColorChroma => {
+                        payload.chroma_saturation = activation.clamp(0.0, 1.0);
+                    }
+                    VisualPrimitiveType::TopologyWireframe => {
+                        payload.wireframe = if activation > 0.5 { 1.0 } else { 0.0 };
+                    }
+                }
+            }
+        }
+
+        payload
+    }
+}
+
+// ────────────────────────────────────────────────────────────
 //  FrameSchema — compositional semantic framing
 //
 //  A FrameSchema defines mandatory relational slots that a
@@ -1446,6 +1726,8 @@ pub mod frame_schemas {
 // Direct re-exports for external crates that need specific types.
 pub use MotorCommandType;
 pub use VisualEffectorBuffer;
+pub use VisualPrimitiveRingBuffer;
+pub use FixedVisualPayload;
 
 // ────────────────────────────────────────────────────────────
 //  Prelude
@@ -1472,5 +1754,13 @@ pub mod prelude {
     pub use super::{
         VisualEffectorBuffer, effector_state,
         EFFECTOR_STATE_FLOATS, EFFECTOR_STATE_WORDS,
+    };
+    pub use super::{
+        VisualPrimitiveType, VisualPrimitiveRingBuffer,
+        FixedVisualPayload,
+        VISUAL_RING_SIZE, VISUAL_RING_MASK,
+        VISUAL_CLUSTER_THRESHOLD,
+        VISUAL_SPATIAL_SCALE, VISUAL_ROTATION_X, VISUAL_ROTATION_Y,
+        VISUAL_ROTATION_Z, VISUAL_COLOR_CHROMA, VISUAL_TOPOLOGY_WIREFRAME,
     };
 }

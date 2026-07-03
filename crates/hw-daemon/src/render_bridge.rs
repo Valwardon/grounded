@@ -40,9 +40,11 @@ pub trait RenderBackend: Send + 'static {
 /// Callback type for AST validation error → GraphArena penalization.
 pub type PenalizeFn = Box<dyn Fn(&str, &str) + Send + Sync>;
 
-/// The render bridge — manages its own thread and polls the effector buffer.
+/// The render bridge — manages its own thread and polls the effector buffer
+/// and visual primitive ring buffer.
 pub struct RenderBridge {
     buffer: Arc<VisualEffectorBuffer>,
+    visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>,
     running: Arc<AtomicBool>,
     thread: Option<std::thread::JoinHandle<()>>,
     backend: Option<Box<dyn RenderBackend>>,
@@ -50,14 +52,17 @@ pub struct RenderBridge {
 }
 
 impl RenderBridge {
-    /// Create a new RenderBridge with the shared effector buffer.
+    /// Create a new RenderBridge with the shared effector buffer
+    /// and optional visual primitive ring buffer.
     ///
-    /// Returns (bridge, buffer_handle). Pass the buffer_handle to
-    /// CognitiveDaemon::new() so both sides share the same buffer.
-    pub fn new() -> (Self, Arc<VisualEffectorBuffer>) {
+    /// Returns (bridge, buffer_handle). Pass the buffer_handle and
+    /// visual_ring to CognitiveDaemon::new() so both sides share
+    /// the same buffers.
+    pub fn new(visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>) -> (Self, Arc<VisualEffectorBuffer>) {
         let buffer = Arc::new(VisualEffectorBuffer::new());
         let bridge = RenderBridge {
             buffer: buffer.clone(),
+            visual_ring,
             running: Arc::new(AtomicBool::new(false)),
             thread: None,
             backend: None,
@@ -94,6 +99,8 @@ impl RenderBridge {
         self.running.store(true, Ordering::Release);
         let running = self.running.clone();
         let buffer = self.buffer.clone();
+        let visual_ring = self.visual_ring.clone();
+        let penalize = self.penalize.take();
 
         // Send backend to the thread; replace with None in self
         let mut backend: Option<Box<dyn RenderBackend>> = self.backend.take();
@@ -104,6 +111,7 @@ impl RenderBridge {
                 .stack_size(2 * 1024 * 1024)
                 .spawn(move || {
                     let mut state = [0.0f32; EFFECTOR_STATE_FLOATS];
+                    let mut visual_payload = FixedVisualPayload::new();
 
                     while running.load(Ordering::Acquire) {
                         // Poll the effector buffer for new state
@@ -112,15 +120,34 @@ impl RenderBridge {
                             if let Some(ref mut b) = backend {
                                 match b.render(&state) {
                                     Ok(hash) => {
-                                        // Render hash can be fed back as
-                                        // CognitiveEvent::RenderFeedback
-                                        // via the event channel if needed
                                         let _ = hash;
                                     }
                                     Err(e) => {
-                                        // Validation error — call penalize
-                                        // In production, parse error for node_id
-                                        eprintln!("[RenderBridge] render error: {}", e);
+                                        if let Some(ref penalize) = penalize {
+                                            penalize("validate_ast", &e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Poll the visual primitive ring buffer
+                        if let Some(ref ring) = visual_ring {
+                            if ring.pop(&mut visual_payload) {
+                                // Payload received — map to render call
+                                let mut vis = [0.0f32; EFFECTOR_STATE_FLOATS];
+                                let arr = visual_payload.as_array();
+                                for (i, v) in arr.iter().enumerate().take(EFFECTOR_STATE_FLOATS.min(6)) {
+                                    vis[i] = *v as f32;
+                                }
+                                if let Some(ref mut b) = backend {
+                                    match b.render(&vis) {
+                                        Ok(_hash) => {}
+                                        Err(e) => {
+                                            if let Some(ref penalize) = penalize {
+                                                penalize("visual_primitive", &e);
+                                            }
+                                        }
                                     }
                                 }
                             }

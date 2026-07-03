@@ -186,8 +186,10 @@ Phase 4 — STDP + Pruning (O(E)):
 Phase 5 — Valence Update (O(N)):
   fire + error → negative; fire + no error → positive; SELF → +0.5 baseline
 
-Phase 6 — Structural Verification (O(N+E)):
+Phase 6 — Structural Verification + Visual Push (O(N+E)):
   energy conservation, path integrity, novelty/valence/edge penalties
+  compute_effector_state() → VisualEffectorBuffer.write()
+  get_active_visual_primitives(activations) → if > VISUAL_CLUSTER_THRESHOLD, VisualPrimitiveRingBuffer.push()
 ```
 
 ## Crate Map
@@ -232,6 +234,96 @@ Phase 6 — Structural Verification (O(N+E)):
 - **Rendering is a motor system** — Effector AST nodes map to MotorCommand grounding. Render output feeds back into predictive coding. Match → Reward. Mismatch → Novelty spike.
 - **Parsing is shift-reduce CCG** — stateless, deterministic, no regex. 6 ad-hoc grammar patterns replaced by 7 combinatory reduction rules. Unrecognized structures degrade to AssociatedWith proximity.
 - **CuriosityBudget replaces recursion_depth** — `KnowledgeGap.budget: CuriosityBudget` instead of `recursion_depth: u8`. Budget is carried through recursive resolution chain.
+
+## Visual Primitive Ring Buffer (Lock-Free SPSC)
+
+Alongside the double-buffered `VisualEffectorBuffer`, there is a **lock-free SPSC ring buffer** (`VisualPrimitiveRingBuffer`) for streaming higher-level visual state from the cognitive daemon thread to the render bridge thread:
+
+```
+Cognitive Daemon (Phase 6)                  Render Bridge Thread
+┌────────────────────────────────┐         ┌──────────────────────────┐
+│                                │         │                          │
+│  get_active_visual_            │  push   │  loop {                  │
+│  primitives(activations)       │────────►│    ring.pop(&payload)   │
+│    → FixedVisualPayload        │         │    backend.render(payload)│
+│                                │  SPSC   │    sleep(8ms)           │
+│  if cluster_activation >       │  Ring   │  }                      │
+│     VISUAL_CLUSTER_THRESHOLD:  │  Buffer │                          │
+│    ring.push(&payload)         │  (64)   │  FixedVisualPayload:    │
+│                                │         │    spatial_scale: f64   │
+│  SensorMapper (Phase 2)        │         │    rotation_x/y/z: f64  │
+│    map_accelerometer(g) →      │         │    chroma_saturation: f64│
+│      RotationX/Y/Z injection   │         │    wireframe: f64       │
+│    map_light(lux) →            │         │                          │
+│      ColorChroma + Scale       │         │  PenalizeFn on error:   │
+│    variance_error(prev,curr)   │         │    -0.05 valence         │
+│      → novelty spike           │         └──────────────────────────┘
+└────────────────────────────────┘
+```
+
+### VisualPrimitiveType (semantic-graph)
+
+6 concrete primitive types stored as `Grounding::VisualPrimitive`:
+
+| Variant | Fixed NodeId | Maps From (SensorMapper) | Activation → Render |
+|---------|-------------|--------------------------|---------------------|
+| `SpatialScale` | 200 | Light sensor (inverse) | 0..1 → scale multiplier |
+| `RotationX` | 201 | Accelerometer X | -1..1 → Euler angle rad |
+| `RotationY` | 202 | Accelerometer Y | -1..1 → Euler angle rad |
+| `RotationZ` | 203 | Accelerometer Z | -1..1 → Euler angle rad |
+| `ColorChroma` | 204 | Light sensor (direct) | 0..1 → chroma saturation |
+| `TopologyWireframe` | 205 | — | >0.5 → wireframe on |
+
+Nodes occupy fixed indices in `GraphArena` via `insert_at()` (pads with empty slots to reach canonical position). `get_active_visual_primitives()` scans by `Grounding::VisualPrimitive`, not by index range.
+
+### FixedVisualPayload (semantic-graph)
+
+```rust
+pub struct FixedVisualPayload {
+    pub spatial_scale: f64,
+    pub rotation_x: f64,
+    pub rotation_y: f64,
+    pub rotation_z: f64,
+    pub chroma_saturation: f64,
+    pub wireframe: f64,
+}
+```
+
+- `wireframe` is binary: `if activation > 0.5 { 1.0 } else { 0.0 }`
+- `cluster_activation() = sum of all 6 absolute values; must exceed VISUAL_CLUSTER_THRESHOLD (0.15 × 6 = 0.9 avg) to push
+- Packed as `[AtomicU64; 6]` via `f64::to_bits()` inside the ring buffer
+
+### VisualPrimitiveRingBuffer (semantic-graph)
+
+Fixed-size SPSC ring buffer (no mutex, no RwLock):
+- `VISUAL_RING_SIZE = 64` slots × 6 `AtomicU64` words = 384 atomic words
+- **Writer** (cognitive daemon, Phase 6): relaxed stores → Release fence → `write_seq` Release
+- **Reader** (render bridge): `read_seq` Relaxed → `write_seq` Acquire → Acquire fence → relaxed loads → `read_seq` Release
+- `push()` returns false if full (caller retries next tick); `pop()` returns false if empty
+- `Sync` because all fields are `AtomicU64`
+- No spinning, no allocations, no locks
+
+### SensorMapper (cognitive-core)
+
+Stateless fixed-point sensor→activation translator:
+
+| Function | Input | Output |
+|----------|-------|--------|
+| `map_accelerometer(gx, gy, gz)` | m/s² | `(RotationX, gx*0.05), (RotationY, gy*0.05), (RotationZ, gz*0.05)` each clamped to [-0.8, 0.8] |
+| `map_light_sensor(lux)` | lux | `(ColorChroma, lux*0.001), (SpatialScale, lux/1000*0.5+0.2)` clamped to [0, 0.8] |
+| `variance_error(prev, curr)` | — | `Some(ratio)` if `\|curr-prev\|/max(\|prev\|,0.001) > 0.3`, else `None` |
+
+- Called during Phase 2 (Injection) in `CognitiveDaemon::handle_event()` on `SensorReading` events
+- Returns `[(NodeId, f64); N]` — injection targets consumed by `ActivationEngine::inject()`
+- Variance error beyond 30% also calls `spike_novelty(ratio * 0.3)`
+
+### validate_ast() → ContractMismatch Valence Penalty
+
+When the render bridge detects a structural error (contract mismatch during render):
+1. `RenderBridge` calls `PenalizeFn` with error string
+2. `PenalizeFn` calls `GraphArena::update_valence(node, -0.05, 0.1)` on all nodes
+3. This feeds into Phase 5 of the next cognitive tick — lower valence on affected paths
+4. The fault is also recorded in `ActivationEngine::structural_faults` for standard error handling
 
 ## Visual Effector Pipeline (Cross-Crate Integration)
 
@@ -304,18 +396,33 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 - `base_primitives::kinetic_energy()` — Motion × Mass, drives rotation scaling
 - `base_primitives::spatial_bound()` — Dimension × Matter, drives color intensity
 - `base_primitives::color_intensity()` — Light × Color, drives palette interpolation
+- `VisualPrimitiveType` — `SpatialScale`, `RotationX/Y/Z`, `ColorChroma`, `TopologyWireframe` enum
+- `Grounding::VisualPrimitive { primitive_type }` — new grounding variant
+- `FixedVisualPayload` — 6 f64 fields (spatial_scale, rotation_x/y/z, chroma_saturation, wireframe)
+- `VisualPrimitiveRingBuffer` — lock-free SPSC `[AtomicU64; 384]` ring buffer (64 slots × 6 words)
+- `VISUAL_RING_SIZE` (64), `VISUAL_RING_MASK` (63), `VISUAL_CLUSTER_THRESHOLD` (0.15)
+- `VISUAL_SPATIAL_SCALE` (200), `VISUAL_ROTATION_X/Y/Z` (201-203), `VISUAL_COLOR_CHROMA` (204), `VISUAL_TOPOLOGY_WIREFRAME` (205) — fixed canonical indices
+- `GraphArena::insert_at()` — insert node at specific raw index, padding with empty slots
+- `GraphArena::get_active_visual_primitives(&self, activations) -> FixedVisualPayload` — extraction method
 
 ### asset-ingestor additions
 - `effector.rs` — `GravityVector`, `PaletteInterpolator`, `SkeletalTransformMatrix` (4×4 rotation, gravity decomposition, rest-pose adjustment)
 - `sensor_transform.rs` — `TransformEngine` (light→palette, accel→skeletal, gravitational→rest-pose), `light_to_palette_matrix()`, `accel_to_skeletal_rotation()`, `gravitational_to_rest_pose()` pure functions
 
 ### hw-daemon additions
-- `render_bridge.rs` — `RenderBridge` (own thread, buffer polling, backend abstraction), `RenderBackend` trait, `NullRenderBackend`, `WgpuRenderBackend` (feature-gated `wgpu`), `PenalizeFn` callback
+- `render_bridge.rs` — `RenderBridge` (own thread, buffer + ring polling, backend abstraction), `RenderBackend` trait, `NullRenderBackend`, `WgpuRenderBackend` (feature-gated `wgpu`), `PenalizeFn` callback
+- `lifecycle.rs` — creates `VisualPrimitiveRingBuffer`, passes to both daemon and bridge; sets penalize callback with -0.05 valence deduction
 
 ### cognitive-core additions
 - `ActivationEngine::effector_buffer: Option<Arc<VisualEffectorBuffer>>` — written to during Phase 6
+- `ActivationEngine::visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>` — written to during Phase 6
 - `ActivationEngine::compute_effector_state()` — aggregates fired MotorCommand nodes into 22-element state array
-- `CognitiveDaemon::new(ctx, effector_buffer)` — accepts shared buffer, passes to ActivationEngine
+- `CognitiveDaemon::new(ctx, effector_buffer, visual_ring)` — accepts both buffers, passes to ActivationEngine
+- `SensorMapper` — stateless fixed-point sensor→visual primitive injection mapper
+- `SensorMapper::map_accelerometer(gx, gy, gz) -> [(NodeId; f64); 3]` — accelerometer→rotation triad
+- `SensorMapper::map_light_sensor(lux) -> [(NodeId; f64); 2]` — light→chroma + scale
+- `SensorMapper::variance_error(prev, curr) -> Option<f64>` — >30% delta → prediction error magnitude
+- `CognitiveDaemon::handle_event()` — SensorReading events call SensorMapper inject into visual primitives
 
 ## Critical Rules for Agent
 
@@ -326,3 +433,6 @@ Own OS thread ("render-bridge") that polls VisualEffectorBuffer:
 5. When adding new Edge construction sites, always use builder methods — never raw struct literal syntax (which omits `dynamic_weight`, `eligibility`, `contract`).
 6. CuriosityBudget replaces all hard depth limits. Never reintroduce `MAX_RECURSION_DEPTH`.
 7. All definition resolution must go through CCG `RelationalParser`, not 6-grammar `parse_predicates()`.
+8. Visual primitive nodes must always be inserted at their fixed canonical indices via `GraphArena::insert_at()` — never via `insert()` — so that `SensorMapper` injection targets and `get_active_visual_primitives()` extraction work correctly.
+9. The SPSC ring buffer (`VisualPrimitiveRingBuffer`) must never be read/written from multiple threads — single producer (cognitive daemon Phase 6) and single consumer (render bridge thread) only.
+10. `SensorMapper` is stateless — all sensor history for variance detection lives in `CognitiveDaemon::prev_sensor_values`, not in the mapper.

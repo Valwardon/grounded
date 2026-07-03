@@ -60,13 +60,29 @@ impl CognitiveLifecycle {
         let ctx = SemanticContext::new(graph);
         self.ctx = Some(ctx.clone());
 
-        // Create render bridge with shared effector buffer
-        let (mut bridge, effector_buffer) = RenderBridge::new();
+        // Create visual primitive ring buffer (SPSC, shared)
+        let visual_ring = Arc::new(VisualPrimitiveRingBuffer::new());
+
+        // Create render bridge with shared effector buffer + visual ring
+        let (mut bridge, effector_buffer) = RenderBridge::new(Some(visual_ring.clone()));
+
+        // Set penalize callback: validate_ast() errors → ContractMismatch → -0.05 valence
+        let ctx_for_penalty = ctx.clone();
+        bridge.set_penalize_fn(Box::new(move |_node_id: &str, _error: &str| {
+            // Penalize all nodes with ContractMismatch → -0.05 valence deduction
+            let graph = ctx_for_penalty.graph.write();
+            for i in 1..graph.len() {
+                let id = NodeId::from_raw(i as u64);
+                graph.update_valence(id, -0.05, 0.1);
+            }
+        }));
         bridge.set_backend(Box::new(NullRenderBackend));
         self.render_bridge = Some(parking_lot::Mutex::new(bridge));
 
-        // Pass the shared buffer to CognitiveDaemon
-        self.daemon = Some(Arc::new(CognitiveDaemon::new(ctx, Some(effector_buffer))));
+        // Pass the shared buffers to CognitiveDaemon
+        self.daemon = Some(Arc::new(CognitiveDaemon::new(
+            ctx, Some(effector_buffer), Some(visual_ring),
+        )));
     }
 
     /// Start the cognitive background loop + render bridge.
@@ -325,6 +341,15 @@ impl CognitiveLifecycle {
             }
         }
 
+        fn visual_primitive_node(label: &str, primitive_type: VisualPrimitiveType, threshold: f64, edges: Vec<Edge>) -> GroundedNode {
+            GroundedNode {
+                id: NodeId::ZERO, label: label.into(), node_type: NodeType::VisualPrimitive,
+                grounding: Grounding::VisualPrimitive { primitive_type },
+                decay: 0.95, threshold, base_activation: 0.0, edges,
+                valence: 0.0,
+            }
+        }
+
         fn state_node(label: &str, keyspace: &str, key: &str, decay: f64, edges: Vec<Edge>) -> GroundedNode {
             GroundedNode {
                 id: NodeId::ZERO, label: label.into(), node_type: NodeType::State,
@@ -334,6 +359,7 @@ impl CognitiveLifecycle {
             }
         }
 
+        // ── Standard sensor/concept/action/state nodes ──
         g.insert(sensor_node("sensor_accelerometer", "accelerometer", 0,
             SensorNorm::Clamp { min: 0.0, max: 1.0 }, 0.85, 2.5, 3));
         g.insert(sensor_node("sensor_proximity", "proximity", 0,
@@ -355,6 +381,22 @@ impl CognitiveLifecycle {
         g.insert(state_node("state_night_mode", "system", "night_mode", 0.99, vec![
             Edge::with_weight(Relation::Inhibits, NodeId::from_raw(8), -0.3),
         ]));
+
+        // ── Visual primitive nodes (fixed canonical indices) ──
+        // These are inserted at their well-known positions so that
+        // SensorMapper injection targets always resolve correctly.
+        g.insert_at(VISUAL_SPATIAL_SCALE, visual_primitive_node(
+            "visual_spatial_scale", VisualPrimitiveType::SpatialScale, 0.5, Vec::new()));
+        g.insert_at(VISUAL_ROTATION_X, visual_primitive_node(
+            "visual_rotation_x", VisualPrimitiveType::RotationX, 0.5, Vec::new()));
+        g.insert_at(VISUAL_ROTATION_Y, visual_primitive_node(
+            "visual_rotation_y", VisualPrimitiveType::RotationY, 0.5, Vec::new()));
+        g.insert_at(VISUAL_ROTATION_Z, visual_primitive_node(
+            "visual_rotation_z", VisualPrimitiveType::RotationZ, 0.5, Vec::new()));
+        g.insert_at(VISUAL_COLOR_CHROMA, visual_primitive_node(
+            "visual_color_chroma", VisualPrimitiveType::ColorChroma, 0.5, Vec::new()));
+        g.insert_at(VISUAL_TOPOLOGY_WIREFRAME, visual_primitive_node(
+            "visual_topology_wireframe", VisualPrimitiveType::TopologyWireframe, 0.5, Vec::new()));
 
         g
     }

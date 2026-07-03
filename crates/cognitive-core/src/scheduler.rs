@@ -7,6 +7,7 @@ use semantic_graph::prelude::*;
 use semantic_parser::{parse_intent, parse_sensor_event};
 
 use crate::activation::*;
+use crate::SensorMapper;
 
 // ────────────────────────────────────────────────────────────
 //  Background cognitive daemon loop
@@ -115,6 +116,9 @@ pub struct CognitiveDaemon {
     /// Optional visual effector buffer shared with the render bridge
     effector_buffer: Option<Arc<VisualEffectorBuffer>>,
 
+    /// Optional lock-free ring buffer for streaming visual primitive payloads.
+    visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>,
+
     /// Previous sensor readings for delta detection (arousal spike)
     prev_sensor_values: parking_lot::Mutex<Vec<(String, u8, f32)>>,
 
@@ -126,13 +130,18 @@ pub struct CognitiveDaemon {
 }
 
 impl CognitiveDaemon {
-    pub fn new(ctx: Arc<SemanticContext>, effector_buffer: Option<Arc<VisualEffectorBuffer>>) -> Self {
+    pub fn new(
+        ctx: Arc<SemanticContext>,
+        effector_buffer: Option<Arc<VisualEffectorBuffer>>,
+        visual_ring: Option<Arc<VisualPrimitiveRingBuffer>>,
+    ) -> Self {
         let event_channel = Arc::new(EventChannel::new());
         let output_channel = Arc::new(RwLock::new(Vec::with_capacity(64)));
         let eb = effector_buffer.clone();
+        let vr = visual_ring.clone();
 
         CognitiveDaemon {
-            engine: parking_lot::Mutex::new(ActivationEngine::new(ctx.clone(), effector_buffer)),
+            engine: parking_lot::Mutex::new(ActivationEngine::new(ctx.clone(), effector_buffer, visual_ring)),
             ctx,
             event_channel,
             output_channel,
@@ -141,6 +150,7 @@ impl CognitiveDaemon {
             tick_interval: Duration::from_millis(16),
             consolidation_counter: std::sync::atomic::AtomicU64::new(0),
             effector_buffer: eb,
+            visual_ring: vr,
             prev_sensor_values: parking_lot::Mutex::new(Vec::with_capacity(8)),
             ticks_since_last_event: std::sync::atomic::AtomicU64::new(0),
             first_tick: std::sync::atomic::AtomicBool::new(true),
@@ -444,6 +454,36 @@ impl CognitiveDaemon {
 
                 let parsed = parse_sensor_event(&sensor, channel, value);
                 let mut engine = self.engine.lock();
+
+                // ── SensorMapper: inject into visual primitive nodes ──
+                match sensor.as_str() {
+                    "accelerometer" => {
+                        let targets = SensorMapper::map_accelerometer(
+                            if channel == 0 { value as f64 } else { 0.0 },
+                            if channel == 1 { value as f64 } else { 0.0 },
+                            if channel == 2 { value as f64 } else { 0.0 },
+                        );
+                        for (node_id, injection) in &targets {
+                            engine.inject(*node_id, *injection);
+                        }
+                    }
+                    "light" => {
+                        let targets = SensorMapper::map_light_sensor(value as f64);
+                        for (node_id, injection) in &targets {
+                            engine.inject(*node_id, *injection);
+                        }
+                    }
+                    _ => {}
+                }
+
+                // ── Variance detection for prediction error → novelty ──
+                if let Some(prev) = prev_value {
+                    let magnitude = SensorMapper::variance_error(prev as f64, value as f64);
+                    if let Some(ratio) = magnitude {
+                        engine.spike_novelty(ratio * 0.3);
+                    }
+                }
+
                 for frame in &parsed.frames {
                     engine.inject_frame(frame, BASE_INJECT);
                 }
