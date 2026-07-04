@@ -97,6 +97,78 @@ pub trait DriveHook: Send {
     fn drive_biases(&mut self, novelty: f64, arousal: f64, reward: f64) -> Vec<(NodeId, f64)>;
 }
 
+// ── AGI Autonomy Trait Hooks ──
+
+/// Hook for autonomous goal formation (Module A).
+///
+/// Called every tick after Phase 4 (prediction errors available).
+/// Monitors prediction errors and drive states to autonomously
+/// create Goal nodes in the semantic graph.
+pub trait GoalFormationHook: Send {
+    /// Run one tick of goal formation. Returns a string representation
+    /// of what was decided (empty string = no action).
+    fn tick(
+        &mut self,
+        prediction_errors: &[PredictionError],
+        activations: &[f64],
+        novelty: f64,
+        arousal: f64,
+        reward: f64,
+        drive_intensities: &[f64; 6],
+        current_tick: u64,
+    ) -> String;
+}
+
+/// Hook for strategic planning with MCTS/Active Inference (Module B).
+///
+/// Called during idle cycles or when DMN switch triggers replanning.
+pub trait StrategicPlannerHook: Send {
+    /// Check if replanning is needed based on prediction errors.
+    fn should_replan(&self, prediction_errors: &[PredictionError]) -> bool;
+    /// Run one planning cycle. Returns a log message describing what was planned.
+    fn plan_cycle(&mut self, prediction_errors: &[PredictionError]) -> String;
+}
+
+/// Hook for tool abstraction layer (Module C).
+///
+/// Maintains affordance signatures and materializes them in the graph.
+pub trait ToolAbstractionHook: Send {
+    /// Materialize affordance edges in the semantic graph.
+    fn materialize_affordances(&mut self) -> usize;
+    /// Scan the graph for new tool-like nodes.
+    fn scan(&mut self) -> usize;
+    /// Count registered affordances.
+    fn count(&self) -> usize;
+}
+
+/// Hook for cross-domain learning (Module D).
+///
+/// Updates domain mapping matrices and executes plan steps.
+pub trait CrossDomainHook: Send {
+    /// Run one learning tick for domain mappings.
+    fn learn_tick(&mut self);
+}
+
+/// Hook for plan execution (Module D).
+///
+/// Manages step-by-step plan advancement with pause/resume.
+pub trait PlanExecutionHook: Send {
+    /// Check if the plan is actively executing.
+    fn is_active(&self) -> bool;
+    /// Get injection targets for the current plan step.
+    fn injection_targets(&self) -> Vec<(u64, f64)>;
+    /// Advance the plan one step. Returns a log message.
+    fn tick(&mut self, prediction_errors: &[PredictionError]) -> String;
+    /// Start executing a plan for the given goal node.
+    fn start_plan_for_goal(&mut self, goal_id: u64);
+    /// Pause execution.
+    fn pause(&mut self);
+    /// Resume execution.
+    fn resume(&mut self);
+    /// Get current status description.
+    fn status_description(&self) -> String;
+}
+
 /// Hook for metacognitive curiosity budget diversion.
 ///
 /// During idle consolidation cycles, the cognitive daemon checks
@@ -266,6 +338,23 @@ pub struct CognitiveDaemon {
     /// Optional drive hook for intrinsic motivation bias injection.
     /// Called every tick to inject drive-based activation.
     drive_hook: parking_lot::Mutex<Option<Box<dyn DriveHook>>>,
+
+    // ── AGI Autonomy Hooks (Modules A–D) ──
+
+    /// Module A: Autonomous goal formation hook.
+    goal_formation: parking_lot::Mutex<Option<Box<dyn GoalFormationHook>>>,
+
+    /// Module B: Strategic planner hook (MCTS + Active Inference).
+    strategic_planner: parking_lot::Mutex<Option<Box<dyn StrategicPlannerHook>>>,
+
+    /// Module C: Tool abstraction layer hook.
+    tool_registry: parking_lot::Mutex<Option<Box<dyn ToolAbstractionHook>>>,
+
+    /// Module D: Cross-domain engine hook.
+    cross_domain: parking_lot::Mutex<Option<Box<dyn CrossDomainHook>>>,
+
+    /// Module D: Plan execution engine hook.
+    plan_execution: parking_lot::Mutex<Option<Box<dyn PlanExecutionHook>>>,
 }
 
 impl CognitiveDaemon {
@@ -299,6 +388,12 @@ impl CognitiveDaemon {
             curiosity_hook: parking_lot::Mutex::new(None),
             cross_modal_registry: Some(CrossModalRegistry::new()),
             drive_hook: parking_lot::Mutex::new(None),
+
+            goal_formation: parking_lot::Mutex::new(None),
+            strategic_planner: parking_lot::Mutex::new(None),
+            tool_registry: parking_lot::Mutex::new(None),
+            cross_domain: parking_lot::Mutex::new(None),
+            plan_execution: parking_lot::Mutex::new(None),
         }
     }
 
@@ -428,6 +523,33 @@ impl CognitiveDaemon {
     /// Called every tick with neuromodulator state; injects drive-based activation.
     pub fn set_drive_hook(&self, hook: Box<dyn DriveHook>) {
         *self.drive_hook.lock() = Some(hook);
+    }
+
+    // ── AGI Autonomy Hook Setters ──
+
+    /// Attach Module A: Autonomous Goal Formation hook.
+    pub fn set_goal_formation_hook(&self, hook: Box<dyn GoalFormationHook>) {
+        *self.goal_formation.lock() = Some(hook);
+    }
+
+    /// Attach Module B: Strategic Planner hook.
+    pub fn set_strategic_planner_hook(&self, hook: Box<dyn StrategicPlannerHook>) {
+        *self.strategic_planner.lock() = Some(hook);
+    }
+
+    /// Attach Module C: Tool Abstraction hook.
+    pub fn set_tool_registry_hook(&self, hook: Box<dyn ToolAbstractionHook>) {
+        *self.tool_registry.lock() = Some(hook);
+    }
+
+    /// Attach Module D: Cross-Domain hook.
+    pub fn set_cross_domain_hook(&self, hook: Box<dyn CrossDomainHook>) {
+        *self.cross_domain.lock() = Some(hook);
+    }
+
+    /// Attach Module D: Plan Execution hook.
+    pub fn set_plan_execution_hook(&self, hook: Box<dyn PlanExecutionHook>) {
+        *self.plan_execution.lock() = Some(hook);
     }
 
     /// Replace the cross-modal fusion registry.
@@ -589,6 +711,54 @@ impl CognitiveDaemon {
                         engine.inject(node_id, amount);
                     }
                 }
+
+                // ════════════════════════════════════════════════════════════
+                //  Phase 6.5 — Autonomous Goal Formation + Strategic Planning
+                //
+                //  Runs after the tick is complete but before consolidation.
+                //  Goal formation monitors prediction errors and drive states
+                //  to autonomously create Goal nodes. Strategic planning runs
+                //  MCTS rollouts when idle (low novelty/arousal).
+                // ════════════════════════════════════════════════════════════
+
+                // Module A: Goal Formation (via trait hook)
+                if let Some(ref mut goal_f) = *self.goal_formation.lock() {
+                    let drive_intensities = [
+                        0.4 + mod_n * 0.3,
+                        0.6 + mod_a * 0.4,
+                        0.3 + mod_r * 0.2,
+                        0.2 + mod_r * 0.15,
+                        0.5 + (1.0 - mod_n) * 0.3,
+                        0.3 + mod_a * 0.2,
+                    ];
+
+                    let activations: Vec<f64> = engine.read_activations().iter()
+                        .map(|(_, v)| *v).collect();
+
+                    let msg = goal_f.tick(
+                        &prediction_errors,
+                        &activations,
+                        mod_n, mod_a, mod_r,
+                        &drive_intensities,
+                        self.ctx.tick.load(std::sync::atomic::Ordering::Relaxed),
+                    );
+
+                    if !msg.is_empty() {
+                        let mut outputs = self.output_channel.write();
+                        outputs.push(CognitiveOutput::LogMessage { level: 1, text: msg });
+                    }
+                }
+
+                // Module B: Strategic Planning (via trait hook)
+                if let Some(ref mut planner) = *self.strategic_planner.lock() {
+                    if planner.should_replan(&prediction_errors) {
+                        let msg = planner.plan_cycle(&prediction_errors);
+                        if !msg.is_empty() {
+                            let mut outputs = self.output_channel.write();
+                            outputs.push(CognitiveOutput::LogMessage { level: 1, text: msg });
+                        }
+                    }
+                }
             }
 
             // ── Episodic recording (events from this tick) ──
@@ -678,7 +848,61 @@ impl CognitiveDaemon {
                 }
             }
 
-            // ── 6. Sleep remaining of tick interval ──
+            // ════════════════════════════════════════════════════════════
+            //  Phase 6.6 — Cross-Domain Learning + Plan Execution
+            //
+            //  Runs every tick after consolidation to:
+            //    - Update cross-domain mapping matrices (learn_tick)
+            //    - Advance the plan execution engine step-by-step
+            //    - Inject activation for the next plan step
+            // ════════════════════════════════════════════════════════════
+
+            // Module D: Cross-domain learning (via trait hook)
+            if let Some(ref mut cd) = *self.cross_domain.lock() {
+                cd.learn_tick();
+            }
+
+            // Module D: Plan execution step advancement (via trait hook)
+            let plan_output = if let Some(ref mut exec) = *self.plan_execution.lock() {
+                if exec.is_active() {
+                    let targets = exec.injection_targets();
+                    for (node_id_raw, energy) in &targets {
+                        let mut engine = self.engine.lock();
+                        engine.inject(NodeId::from_raw(*node_id_raw), *energy);
+                    }
+
+                    let msg = exec.tick(&prediction_errors);
+                    if !msg.is_empty() {
+                        Some(msg)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            if let Some(msg) = plan_output {
+                let mut outputs = self.output_channel.write();
+                outputs.push(CognitiveOutput::LogMessage { level: 1, text: msg });
+            }
+
+            // Module C: Materialize affordances in graph (periodic)
+            let current_tick = self.ctx.tick.load(std::sync::atomic::Ordering::Relaxed);
+            if current_tick > 0 && current_tick % 5000 == 0 {
+                if let Some(ref mut registry) = *self.tool_registry.lock() {
+                    let count = registry.materialize_affordances();
+                    let mut outputs = self.output_channel.write();
+                    outputs.push(CognitiveOutput::LogMessage {
+                        level: 1,
+                        text: format!("[TOOLS] Materialized {} affordances in graph", count),
+                    });
+                }
+            }
+
+            // ── 7. Sleep remaining of tick interval ──
             let elapsed = loop_start.elapsed();
             if elapsed < self.tick_interval {
                 std::thread::sleep(self.tick_interval - elapsed);

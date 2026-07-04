@@ -216,6 +216,13 @@ pub enum Relation {
     Achieves,
     /// One goal blocks or conflicts with another.
     Blocks,
+    /// A concept affords a tool-use action (functional affordance).
+    /// S → T: concept S can act as a tool to achieve T.
+    /// Grounded in sensorimotor properties, not labels.
+    Affords,
+    /// Connects a concept to its domain signature for cross-domain transfer.
+    /// S → T: concept S belongs to domain T (e.g., "geometry" or "kinematics").
+    DomainOf,
 }
 
 impl Relation {
@@ -239,6 +246,8 @@ impl Relation {
             Relation::Drives => 0.7,
             Relation::Achieves => 0.8,
             Relation::Blocks => -0.7,
+            Relation::Affords => 0.75,
+            Relation::DomainOf => 0.6,
         }
     }
 
@@ -282,6 +291,11 @@ impl Relation {
             },
             Relation::Achieves => InvariantContract::Causal,
             Relation::Blocks => InvariantContract::Causal,
+            Relation::Affords => InvariantContract::DataFlow {
+                output_type: DataType::Activation,
+                input_type: DataType::Activation,
+            },
+            Relation::DomainOf => InvariantContract::Taxonomic,
         }
     }
 }
@@ -406,7 +420,38 @@ pub enum Grounding {
         timestamp_ms: u64,
         importance: f64,
     },
+    /// Functional affordance — a sensorimotor property signature.
+    /// Describes what a concept offers in terms of reaching, manipulating,
+    /// and transforming the world — purely geometric/kinematic, not semantic.
+    /// reach_extension: 0.0 (none) .. 1.0 (extends reach significantly)
+    /// energy_cost: 0.0 (free) .. 1.0 (very expensive)
+    /// manipulator_type: what kind of manipulation this affords
+    /// effect_vector: the PrimitiveVector this tool projects onto the world
+    Affordance {
+        reach_extension: f64,
+        energy_cost: f64,
+        manipulator_type: AffordanceType,
+        effect_vector: [f64; 5],
+    },
     Abstract,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AffordanceType {
+    /// Extends the body's reach (e.g., stick, tool)
+    Reach,
+    /// Contains or holds (e.g., container, cup)
+    Contain,
+    /// Modifies surface (e.g., brush, cloth)
+    Surface,
+    /// Provides information (e.g., sensor, gauge)
+    Sense,
+    /// Provides structural support (e.g., platform, wall)
+    Support,
+    /// Connects two things (e.g., rope, wire)
+    Connect,
+    /// General-purpose manipulation
+    Manipulate,
 }
 
 /// Types of motor effector commands for the unified render loop.
@@ -519,6 +564,9 @@ pub enum NodeType {
     Value,
     /// A foresight simulation branch — parallel "what-if" timeline.
     Simulation,
+    /// A tool node — a concept with functional affordance grounding.
+    /// Connected to actions via Affords edges.
+    Tool,
 }
 
 // ────────────────────────────────────────────────────────────
@@ -2022,6 +2070,7 @@ pub mod prelude {
     };
     pub use super::{
         InvariantContract, DataType, StructuralError,
+        AffordanceType,
     };
     pub use super::{
         VisualEffectorBuffer, effector_state,

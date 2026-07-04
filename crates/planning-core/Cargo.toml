@@ -7,6 +7,7 @@ description = "Hierarchical planner + foresight engine + value system for ground
 [dependencies]
 semantic-graph = { path = "../semantic-graph" }
 cognitive-core = { path = "../cognitive-core" }
+episodic-memory = { path = "../episodic-memory" }
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true

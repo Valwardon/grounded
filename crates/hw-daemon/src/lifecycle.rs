@@ -152,6 +152,57 @@ impl CognitiveLifecycle {
             "[PLAN] Goal={} confidence={:.2} risk={:.2} steps={}",
             goal_id.0, plan.confidence, foresight_result.risk_score, plan.steps.len(),
         );
+
+        // ════════════════════════════════════════════════════════════
+        //  Wire AGI Autonomy Engines (Modules A–D)
+        // ════════════════════════════════════════════════════════════
+
+        // Module A: Autonomous Goal Formation
+        // Monitors prediction errors and drive deprivation to autonomously
+        // create Goal nodes in the semantic graph.
+        let goal_formation = planning_core::GoalFormationEngine::new(ctx.clone());
+        daemon.set_goal_formation_hook(Box::new(goal_formation));
+        eprintln!("[AUTONOMY] Module A: Goal Formation Hook initialized");
+
+        // Module B: Strategic Planner (MCTS + Active Inference)
+        // Extends HierarchicalPlanner with roll-out MCTS over episodic
+        // memory and Active Inference Expected Free Energy for action selection.
+        let strategic_planner = planning_core::StrategicPlanner::new(ctx.clone());
+        daemon.set_strategic_planner_hook(Box::new(strategic_planner));
+        eprintln!("[AUTONOMY] Module B: Strategic Planner Hook initialized");
+
+        // Module C: Tool Abstraction Layer (AffordanceRegistry)
+        // Scans the semantic graph for concept/entity/tool nodes and
+        // derives their functional affordance signatures from PrimitiveVectors.
+        let mut tool_registry = planning_core::AffordanceRegistry::new(ctx.clone());
+        tool_registry.scan_graph();
+        eprintln!(
+            "[AUTONOMY] Module C: Tool Affordance Registry initialized with {} entries",
+            tool_registry.count(),
+        );
+        daemon.set_tool_registry_hook(Box::new(tool_registry));
+
+        // Module D: Cross-Domain Engine
+        // Manages domain mappings (geometry→kinematics, etc.) and projects
+        // concepts between domain subspaces via PrimitiveVector transformations.
+        let mut cross_domain = planning_core::CrossDomainEngine::new(ctx.clone());
+
+        // Register default domain mappings (identity — learned over time)
+        cross_domain.register_mapping(
+            planning_core::DomainMapping::new("geometry", "kinematics")
+        );
+        cross_domain.register_mapping(
+            planning_core::DomainMapping::new("spatial", "temporal")
+        );
+        daemon.set_cross_domain_hook(Box::new(cross_domain));
+        eprintln!("[AUTONOMY] Module D: Cross-Domain Hook initialized");
+
+        // Module D: Plan Execution Engine
+        // Manages step-by-step plan execution with DMN pause/resume,
+        // parallel branch forking, and condition checking.
+        let plan_execution = planning_core::PlanExecutionEngine::new(ctx.clone());
+        daemon.set_plan_execution_hook(Box::new(plan_execution));
+        eprintln!("[AUTONOMY] Module D: Plan Execution Hook initialized");
     }
 
     /// Start the cognitive background loop + render bridge.
