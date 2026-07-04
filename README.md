@@ -249,6 +249,81 @@ The query API supports recollection:
 
 This gives the engine a genuine, queryable past — not just conceptual knowledge, but *memory of what happened and when*.
 
+### Autonomous Planning & Execution
+
+Four runtime modules give the engine the ability to form its own goals, plan toward them, use tools, and generalize across domains — all deterministically, without ML or randomness.
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                  Autonomy Pipeline (Phase 6.5/6.6)           │
+│                                                              │
+│  ┌──────────────────┐    ┌──────────────────────────────┐   │
+│  │ Module A          │    │ Module B                    │   │
+│  │ GoalFormationEngine│──►│ StrategicPlanner            │   │
+│  │                   │    │                              │   │
+│  │ P = α·Eₚ + β·N   │    │ MCTS: select(UBC1)          │   │
+│  │   + γ·D_dep + δ·S│    │ expand(Precedes edges)      │   │
+│  │                   │    │ rollout(episodic memory)    │   │
+│  │ Creates Goal nodes│    │ backpropagate               │   │
+│  │ in semantic graph │    │ choose(EFE minimization)    │   │
+│  └────────┬──────────┘    └────────────┬─────────────────┘   │
+│           │                            │                      │
+│           │   ┌──────────────────┐    │                      │
+│           │   │ Module C          │    │                      │
+│           └───► AffordanceRegistry│   │                      │
+│               │                   │    │                      │
+│               │ scan_graph()      │    │                      │
+│               │ match(cosine sim) │    │                      │
+│               │ materialize()     │    │                      │
+│               │ every 5000 ticks  │    │                      │
+│               └──────────────────┘    │                      │
+│                                       ▼                      │
+│               ┌─────────────────────────────────────────┐   │
+│               │ Module D                                 │   │
+│               │ CrossDomainEngine + PlanExecutionEngine   │   │
+│               │                                         │   │
+│               │ ┌──────────────┐  ┌─────────────────┐  │   │
+│               │ │ DomainMapping │  │ PlanExecution  │  │   │
+│               │ │ 5×5 matrices  │  │ step advance    │  │   │
+│               │ │ project()     │  │ pause/resume    │  │   │
+│               │ │ learn_tick()  │  │ branch inject   │  │   │
+│               │ └──────────────┘  └─────────────────┘  │   │
+│               └─────────────────────────────────────────┘   │
+│                                                              │
+│  All wired via trait hooks — no circular dependencies        │
+│  cognitive-core ──traits── planning-core ──dep── cognitive-core
+└─────────────────────────────────────────────────────────────┘
+```
+
+**Module A — Goal Formation Engine.** Monitors per-node prediction error histories (ring buffer of 64 recent errors) and systemic efficiency across all nodes. When a node shows chronic prediction error, combined with drive deprivation signals, the engine creates a `NodeType::Goal` node in the semantic graph with a computed priority:
+
+```
+P = α × Eₚ (mean prediction error)
+  + β × N (novelty modulation)
+  + γ × Δ_dep (drive deprivation)
+  + δ × S_ineff (systemic inefficiency)
+```
+
+Coefficients default to `α=0.35, β=0.25, γ=0.25, δ=0.15`. Goals are added to the graph as `Goal { status: GoalStatus::Active }` nodes linked to the source node via `Relation::SubGoalOf`.
+
+**Module B — Strategic Planner.** Runs MCTS over the semantic graph using UCB1 for node selection, expanding from `Relation::Precedes` edges. Rollouts use episodic memory (`query_by_node_label()`) for deterministic simulation, falling back to `ForesightEngine::simulate_action()` when no memory is available. Action selection minimizes Expected Free Energy:
+
+```
+G = 0.5 × E[error] + 0.3 × E[novelty] − 0.2 × E[cost]
+```
+
+A DMN switch triggers replanning when mean prediction error exceeds threshold (default 0.3). The planner produces a `Plan { steps, total_cost, confidence }` consumed by Module D.
+
+**Module C — Tool Abstraction Layer.** Scans the graph for nodes matching tool-like types and derives affordance signatures — a 5-dimensional vector `[reach_extension, energy_cost, precision, force, temporal_duration]`. Matching uses cosine similarity on the signature vector (no string matching). Every 5000 ticks, the registry materializes `Relation::Affords` edges in the graph, connecting tool nodes to action nodes.
+
+**Module D — Cross-Domain Engine + Plan Execution.** Two sub-engines:
+
+- `CrossDomainEngine` maintains a 5×5 domain mapping matrix between named domains (e.g., geometry→kinematics, spatial→temporal). `project_concept()` transforms a concept's PrimitiveVector from one domain subspace to another. `learn_tick()` updates mapping weights based on co-occurrence of concepts across domains during execution.
+
+- `PlanExecutionEngine` manages the step-by-step advancement of a plan. Each tick, it checks the current step's prediction error: if error < 0.2, the step advances; otherwise the engine pauses. Supports parallel branches via `injection_targets()` which returns `(NodeId, energy)` pairs for injecting activation into multiple graph nodes simultaneously.
+
+All four modules are wired into the tick loop as Phase 6.5 (goal formation + strategic planning, after drive bias injection) and Phase 6.6 (cross-domain learning + plan execution, after consolidation). The bridge between `cognitive-core` (which owns the tick loop) and `planning-core` (which implements the engines) uses trait hooks — `GoalFormationHook`, `StrategicPlannerHook`, `ToolAbstractionHook`, `CrossDomainHook`, `PlanExecutionHook` — avoiding any circular dependency.
+
 ### The Self Node
 
 Node index 1 is always `SELF` — the engine's persistent "I". Pre-inserted with base activation 1.0 and decay 1.0, it never fades. Every experience attaches here:
